@@ -1,0 +1,54 @@
+# --- QMIX specific parameters ---
+
+# use epsilon greedy action selector
+action_selector: "epsilon_greedy"
+epsilon_start: 1.0
+epsilon_finish: 0.05
+epsilon_anneal_time: 50000
+
+runner: "diff"
+mac: "diff_mac"
+agent: "rnn" 
+buffer_size: 5000
+
+# update the target network every {} episodes
+target_update_interval: 200
+
+# use the Q_Learner to train
+agent_output_type: "q"
+learner: "diff_learner"
+double_q: True
+mixer: "qmix"
+mixing_embed_dim: 32
+hypernet_layers: 2
+hypernet_embed: 64
+latent_dim: 4
+vae_hidden_dim: 64
+sample_size: 64
+hilp_sample_size: 64
+discount: 0.99
+expectile: 0.95
+p_nextgoal: 0.5
+reward_scale: 1.0
+reward_shift: 0.0
+name: "diff"
+
+
+diff_num: 10
+
+upper_bound_thed : 0.6 #阈值上限
+lower_bound_thed : 0.4 #阈值下限
+decay_rate_thed : 0.0
+
+start_ratio: 0.2 #初始状态上限
+end_ratio: 0.9 #目标状态上限
+begin_ratio: 0.7 #目标状态下限
+
+post_exp_ratio: 0.1 #二阶段的奖励系数
+return_scale: 1.0 #目标收益的放缩系数
+alpha: 0.5
+
+use_hilp: False
+swap_goals: False
+load_diffusion: False
+n_timesteps: 20

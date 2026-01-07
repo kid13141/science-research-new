@@ -1,0 +1,530 @@
+import copy
+from components.episode_buffer import EpisodeBatch
+from modules.mixers.vdn import VDNMixer
+from modules.mixers.qmix import QMixer
+from modules.mixers.exp_qmix import Exp_QMixer
+import torch as th
+from torch.optim import RMSprop, Adam
+import numpy as np
+import utils.trajectory_encoder as tra_enc
+import torch.nn.functional as F
+from collections import namedtuple
+RewardBatch = namedtuple('Batch', 'trajectories conditions returns')
+
+def to_numpy(input_data):
+    # 判断输入类型是否为 tensor
+    if isinstance(input_data, th.Tensor):
+        return input_data.cpu().numpy()  # 将 tensor 转换为 numpy 数组
+    else:
+        return input_data  # 如果不是 tensor，原样返回
+    
+def to_tensor(input_data):
+    # 判断输入类型是否为 numpy 数组
+    if isinstance(input_data, np.ndarray):
+        return th.from_numpy(input_data).cuda()  # 将 numpy 数组转换为 tensor
+    else:
+        return input_data  # 如果不是 numpy 数组，原样返回
+
+def expectile_loss(adv, diff, expectile=0.7):
+    weight = th.where(adv >= 0, expectile, (1 - expectile))
+    return weight * (diff**2)
+
+def normalize_states(states: np.ndarray, max: np.ndarray, min: np.ndarray):
+    states=th.tensor((states - min) / (max-min+1e-5))
+    states=th.where(th.isnan(states), th.full_like(states, 0), states)
+    return states.cpu().numpy()
+        
+def non_normalized(states:np.ndarray,max:np.ndarray,min:np.ndarray):
+    states_new=[]
+    for s in states:
+        b=s*(max-min)+min
+        states_new.append(b.tolist())
+    return np.array(states_new)
+
+def linear_decay(initial_value, lower_bound, decay_rate, current_time):
+    decayed_value = max(lower_bound, initial_value - decay_rate * current_time / 1e4)
+    return decayed_value
+
+class IAU(th.nn.Module):
+    def __init__(self, input_dim, n_action):
+        super().__init__()
+        self.fc1 = th.nn.Linear(input_dim, 64)
+        self.fc2 = th.nn.Linear(64, n_action)
+
+    def forward(self, x):
+        y = F.relu(self.fc1(x))
+        y = self.fc2(y)
+        return y
+
+def compute_infonce_loss(c_t, d):
+
+    logits = th.matmul(c_t, d.T)
+    exp_logits = th.exp(logits)
+
+    positive_pairs = th.diagonal(exp_logits, dim1=-2, dim2=-1)
+    denominator = exp_logits.sum(dim=-1)
+    info_nce_loss = -th.log(positive_pairs / denominator).mean()
+
+    return info_nce_loss
+
+class MultiLearner:
+    def __init__(self, mac, scheme, logger, args):
+        self.args = args
+        self.mac = mac
+        self.logger = logger
+        self.n_agents = args.n_agents
+        self.params = list(mac.parameters())
+
+        self.diff_params = mac.temporal_net.parameters()
+
+        self.last_target_update_episode = 0
+
+        self.mixer = None
+
+
+        self.IAU = IAU(input_dim=self.args.rnn_hidden_dim+1+self.args.teammate_dim,n_action=self.args.n_actions)
+        # self.OAU1 = IAU(input_dim=self.args.rnn_hidden_dim+1,n_action=self.args.n_actions)
+        # self.OAU2 = IAU(input_dim=self.args.rnn_hidden_dim+1,n_action=self.args.n_actions)
+
+        self.params += list(self.IAU.parameters())
+        # self.params += list(self.OAU1.parameters())
+        # self.params += list(self.OAU2.parameters())
+
+        if args.mixer is not None:
+            if args.mixer == "vdn":
+                self.mixer = VDNMixer()
+            elif args.mixer == "qmix":
+                self.mixer = QMixer(args)
+            else:
+                raise ValueError("Mixer {} not recognised.".format(args.mixer))
+            self.params += list(self.mixer.parameters())
+            self.target_mixer = copy.deepcopy(self.mixer)
+
+        self.optimiser = RMSprop(params=self.params, lr=args.lr, alpha=args.optim_alpha, eps=args.optim_eps)
+        self.diff_optimiser = Adam(params=self.diff_params, lr=args.lr, weight_decay=getattr(args, "weight_decay", 0))
+
+        # a little wasteful to deepcopy (e.g. duplicates action selector), but should work for any MAC
+        self.target_mac = copy.deepcopy(mac)
+        self.target_IAU = copy.deepcopy(self.IAU)
+        # self.target_OAU1 = copy.deepcopy(self.OAU1)
+        # self.target_OAU2 = copy.deepcopy(self.OAU2)
+
+        self.log_stats_t = -self.args.learner_log_interval - 1
+        self.last_diff_return = 1
+
+    
+    # def train_hilp(self, batch, t_env):
+    #         hilp_state, hilp_next_state, hilp_goal, hilp_reward, hilp_mask = self.rebuild_batch(batch)
+    #         value_loss, value_info = self.compute_value_loss(hilp_state, hilp_next_state, hilp_goal, hilp_reward, hilp_mask)
+    #         self.mac.embedding.optim_net.zero_grad()
+    #         value_loss.backward()
+    #         self.mac.embedding.optim_net.step()
+    #         self.logger.log_stat("v_max", value_info["v max"].item(), t_env)
+    #         self.logger.log_stat("v_min", value_info["v min"].item(), t_env)
+    #         self.logger.log_stat("v_avg", value_info["v mean"].item(), t_env)
+    #         self.logger.log_stat("value_loss", value_loss.item(), t_env)
+    
+    def split_global_vector(self, global_vector, N, M, teammate_dim, enemy_dim):
+        """
+        Split the global input vector into teammate and enemy feature tensors.
+
+        :param global_vector: Tensor of shape (batch_size, total_length), the global input vector.
+        :param N: Number of teammates.
+        :param M: Number of enemies.
+        :param teammate_dim: Dimensionality of each teammate's feature vector.
+        :param enemy_dim: Dimensionality of each enemy's feature vector.
+        :return: Tuple (teammates, enemies)
+            - teammates: Tensor of shape (batch_size, N, teammate_dim).
+            - enemies: Tensor of shape (batch_size, M, enemy_dim).
+        """
+        batch_size = global_vector.size(0)
+        total_length = global_vector.size(1)
+        
+        # Calculate expected length
+        expected_length = N * teammate_dim + M * enemy_dim
+        if total_length != expected_length:
+            raise ValueError(f"Global vector length ({total_length}) does not match the expected length ({expected_length}).")
+        
+        # Reshape the global vector
+        teammate_features = global_vector[:, :N * teammate_dim].view(batch_size, N, teammate_dim)
+        
+        return teammate_features
+    
+    def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
+        max_seq_length = batch.max_seq_length
+        # Get the relevant quantities
+        state = batch["state"][:,:-1]
+        rewards = batch["reward"][:, :-1] # (32,200,1)
+        factor_rewards = batch["factor_reward"][:,:-1].squeeze(3) 
+        actions = batch["actions"][:, :-1]
+        terminated = batch["terminated"][:, :-1].float()
+        filled = batch["filled"][:, :-1].float()
+        mask = batch["filled"][:, :-1].float()
+        mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
+        avail_actions = batch["avail_actions"]
+        goal_states = batch["goal"][:,:-1]
+
+        # Get the threshold of first phase
+        alpha = linear_decay(self.args.alpha, 0, 0.002, t_env)
+
+        # Diffusion Training
+        diffusion_losses = []
+        for i in range(1):
+            x, cond, returns = self.rebuild_diff_batch(batch)
+            loss,_ = self.mac.diffusion_agent.loss(x, cond, returns)
+            self.diff_optimiser.zero_grad()
+            loss.backward()
+            self.diff_optimiser.step()
+            diffusion_losses.append(loss.item())
+        diffusion_loss = np.array(diffusion_losses).mean(-1).item()
+        diff_return = returns.detach().cpu().max()
+        self.last_diff_return = diff_return
+
+
+        # Calculate estimated Q-Values
+        mac_out = []
+        self.mac.init_hidden(state.shape[0])
+        hidden_states =[]
+        split_goals = self.split_global_vector(goal_states[:, 0, :], self.args.n_agents, self.args.n_enemy, self.args.teammate_dim, self.args.enemy_dim)
+        split_goals_org = split_goals
+        split_goals = split_goals.unsqueeze(1).repeat(1, goal_states.shape[1], 1, 1)
+
+        for t in range(max_seq_length):
+            agent_outs,hidden_states_outs = self.mac.forward(batch, t=t) 
+            mac_out.append(agent_outs)
+            hidden_states_outs = hidden_states_outs.tolist()
+            hidden_states.append(hidden_states_outs)
+
+        mac_out = th.stack(mac_out, dim=1)  # Concat over time
+        hidden_states = th.tensor(hidden_states)
+        split_result = []
+        for i in range(self.n_agents):
+            part = hidden_states[:, i * batch.batch_size:(i + 1) * batch.batch_size, :]
+            split_result.append(part)
+        stacked_tensor = th.stack(split_result, dim=2) # (201,32,5,64)
+
+        hidden_states = stacked_tensor.permute(1, 0, 2, 3).cuda()
+        target_hidden_states = hidden_states.clone()[:,1:]
+        hidden_states = hidden_states.clone()[:,:-1]
+        
+
+        # Pick the Q-Values for the actions taken by each agent
+        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)      
+        IAU_inputs = self._get_IAU_input(batch.batch_size, chosen_action_qvals.unsqueeze(3), hidden_states, split_goals) # chosen_action_qvals.shape = (32,200,5,1) hiddden_states.shape = (32,200,5,64) 
+        IAU_out = self.IAU(IAU_inputs) 
+        IAU_out_action_qvals = th.gather(IAU_out, dim=3, index=actions) 
+
+        # OAU_inputs = self._get_OAU_input(batch.batch_size, chosen_action_qvals.unsqueeze(3), hidden_states.clone()) # chosen_action_qvals.shape = (32,200,5,1) hiddden_states.shape = (32,200,5,64) 
+        # OAU_out1 = self.OAU1(OAU_inputs) 
+        # OAU_out2 = self.OAU2(OAU_inputs) 
+        # OAU_out_action_qvals_1 = th.gather(OAU_out1, dim=3, index=actions) 
+        # OAU_out_action_qvals_2 = th.gather(OAU_out2, dim=3, index=actions) 
+
+        # Calculate the Q-Values necessary for the target
+        target_mac_out = []
+        self.target_mac.init_hidden(state.shape[0])
+
+        for t in range(max_seq_length):
+            target_agent_outs,_= self.target_mac.forward(batch, t=t)
+            target_mac_out.append(target_agent_outs)
+
+        # We don't need the first timesteps Q-Value estimate for calculating targets
+        target_mac_out = th.stack(target_mac_out[1:], dim=1)  
+        # Mask out unavailable actions
+        target_mac_out[avail_actions[:, 1:] == 0] = -9999999
+
+
+        # Max over target Q-Values
+        if self.args.double_q:
+            mac_out_detach = mac_out.clone().detach()
+            mac_out_detach[avail_actions == 0] = -9999999
+            cur_max_actions = mac_out_detach[:, 1:].max(dim=3, keepdim=True)[1] #the index of max q action 
+            target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3) # (32,200,5)
+        
+        else:
+            target_max_qvals = target_mac_out.max(dim=3)[0]
+
+        # loc Q
+        target_IAU_inputs = self._get_IAU_input(batch.batch_size, target_max_qvals.unsqueeze(3), target_hidden_states, split_goals)
+        target_IAU_out = self.target_IAU(target_IAU_inputs)
+        target_IAU_out_max_qvals = target_IAU_out.max(dim=3)[0]
+
+        # target_OAU_inputs = self._get_OAU_input(batch.batch_size, target_max_qvals.unsqueeze(3), target_hidden_states)
+        # target_OAU_out_1 = self.target_OAU1(target_OAU_inputs)
+        # # target_OAU_out_2 = self.target_OAU2(target_OAU_inputs)
+        # target_OAU_out_1[avail_actions[:,1:,:,:] == 0] = -9999999
+        # # target_OAU_out_2[avail_actions[:,1:,:,:] == 0] = -9999999
+        # # OAU_out_detach = OAU_out.clone().detach()
+        # # OAU_out_detach[avail_actions[:,1:,:,:] == 0] = -9999999
+        # # OAU_cur_max_actions = OAU_out_detach.max(dim=3, keepdim=True)[1] #the index of max q action 
+        # # target_OAU_out_max_qvals = th.gather(target_OAU_out, 3, OAU_cur_max_actions).squeeze(3)
+        # target_OAU_out_max_qvals_1 = target_OAU_out_1.max(dim=3)[0]
+        # # target_OAU_out_max_qvals_2 = target_OAU_out_2.max(dim=3)[0]
+        # # target_OAU_out_max_qvals = th.min(target_OAU_out_max_qvals_1, target_OAU_out_max_qvals_2)
+
+        mask_iau = mask.expand_as(factor_rewards)
+
+        # mask_oau = (1 - stops) * mask
+        # mask_oau = mask_oau.expand_as(explore_rewards)
+
+        IAUtargets = factor_rewards + self.args.gamma * mask_iau * target_IAU_out_max_qvals
+        td_error_iau = (IAU_out_action_qvals.squeeze(3) - IAUtargets.detach()) # (32,200,5)
+
+        # OAUtargets_1 = explore_rewards + self.args.gamma * mask_oau * target_OAU_out_max_qvals_1
+        # # OAUtargets_2 = explore_rewards + self.args.gamma * mask_oau * target_OAU_out_max_qvals
+        # td_error_oau_1 = (OAU_out_action_qvals_1.squeeze(3) - OAUtargets_1.detach()) # (32,200,5)
+        # # td_error_oau_2 = (OAU_out_action_qvals_2.squeeze(3) - OAUtargets_1.detach()) # (32,200,5)
+
+        iau_td_error = td_error_iau * mask_iau
+        loss_iau = (iau_td_error ** 2).sum() / (mask_iau.sum() + 1)
+
+        # oau_td_error_1 = td_error_oau_1 * mask_oau
+        # loss_oau1 = (oau_td_error_1 ** 2).sum() / (mask_oau.sum() + 1)
+
+        # oau_td_error_2 = td_error_oau_2 * mask_oau
+        # loss_oau2 = (oau_td_error_2 ** 2).sum() / (mask_oau.sum() + 1)
+
+        # Mix
+        if self.mixer is not None:
+            chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
+            target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
+
+        # Q_total
+        targets = rewards + self.args.gamma * (1 - terminated) * target_max_qvals           
+        td_error = (chosen_action_qvals - targets.detach())
+
+        mask = mask.expand_as(td_error)
+        masked_td_error = td_error * mask
+        
+        # total loss
+        loss = (masked_td_error ** 2).sum() / mask.sum() 
+        loss = loss + alpha * loss_iau
+
+        # Optimise
+        self.optimiser.zero_grad()
+        loss.backward()
+        grad_norm = th.nn.utils.clip_grad_norm_(self.params, self.args.grad_norm_clip)
+        self.optimiser.step()
+        
+        # Calculate exp_reward
+        factor_rewards = np.array(factor_rewards.cpu())
+        prior_exp_reward = factor_rewards.sum(-1).sum(-1).mean()
+
+        # explore_rewards = np.array(explore_rewards.cpu())
+        # post_exp_reward = explore_rewards.sum(-1).sum(-1).mean()
+
+        if (episode_num - self.last_target_update_episode) / self.args.target_update_interval >= 1.0:
+            self._update_targets()
+            self.last_target_update_episode = episode_num
+
+        if t_env - self.log_stats_t >= self.args.learner_log_interval:
+            self.logger.log_stat("loss", loss.item(), t_env)
+            self.logger.log_stat("iau_loss", loss_iau.item(), t_env)
+            # self.logger.log_stat("oau_loss", loss_oau.item(), t_env)
+            # self.logger.log_stat("value_loss", value_loss.item(), t_env)
+            self.logger.log_stat("diff_loss", diffusion_loss, t_env)
+            self.logger.log_stat("prior_exp_reward", prior_exp_reward.item(), t_env)
+            # self.logger.log_stat("post_exp_reward", post_exp_reward.item(), t_env)
+            self.logger.log_stat("diff_return", diff_return.item(), t_env)
+            # self.logger.log_stat("v_max", value_info["v max"].item(), t_env)
+            # self.logger.log_stat("v_min", value_info["v min"].item(), t_env)
+            # self.logger.log_stat("v_avg", value_info["v mean"].item(), t_env)
+            self.logger.log_stat("grad_norm", grad_norm, t_env)
+            mask_elems = mask.sum().item()
+            mask_iau_elems = mask_iau.sum().item()
+            # mask_oau_elems = mask_oau.sum().item()
+            self.logger.log_stat("td_error_abs", (masked_td_error.abs().sum().item()/mask_elems), t_env)
+            self.logger.log_stat("q_taken_mean", (chosen_action_qvals * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
+            self.logger.log_stat("iau_q_taken_mean", (IAU_out_action_qvals.squeeze() * mask_iau).sum().item()/(mask_iau_elems), t_env)
+            # self.logger.log_stat("oau_q_taken_mean", (OAU_out_action_qvals_1.squeeze() * mask_oau).sum().item()/(mask_oau_elems), t_env)
+            self.logger.log_stat("target_mean", (targets * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
+            self.log_stats_t = t_env
+        return diff_return.item()
+    
+    def _get_IAU_input(self, size, action_values, encoded, goals):
+        IAU_inputs = th.cat((action_values,encoded, goals),dim=-1)
+        return IAU_inputs
+    
+    def _get_OAU_input(self, size, action_values, encoded):
+        OAU_inputs = th.cat((action_values,encoded),dim=-1)
+        return OAU_inputs
+
+    def _build_inputs(self, batch, t):
+
+        bs = batch.batch_size
+        inputs = []
+        inputs.append(batch["obs"][:, t])  # b1av
+        inputs = th.cat([x.reshape(bs, self.n_agents, -1) for x in inputs], dim=2)
+        return inputs
+    
+    def _update_targets(self):
+        self.target_mac.load_state(self.mac)
+        self.target_IAU.load_state_dict(self.IAU.state_dict())
+        # self.target_OAU1.load_state_dict(self.OAU1.state_dict())
+        # self.target_OAU2.load_state_dict(self.OAU2.state_dict())
+        if self.mixer is not None:
+            self.target_mixer.load_state_dict(self.mixer.state_dict())
+        self.logger.console_logger.info("Updated target network")
+
+    def cuda(self):
+        self.mac.cuda()
+        self.target_mac.cuda()
+        self.IAU.cuda()
+        self.target_IAU.cuda()
+        # self.OAU1.cuda()
+        # self.OAU2.cuda()
+        # self.target_OAU1.cuda()
+        # self.target_OAU2.cuda()
+        if self.mixer is not None:
+            self.mixer.cuda()
+            self.target_mixer.cuda()
+
+    def save_models(self, path):
+        self.mac.save_models(path)
+        if self.mixer is not None:
+            th.save(self.mixer.state_dict(), "{}/mixer.th".format(path))
+        th.save(self.optimiser.state_dict(), "{}/opt.th".format(path))
+        th.save(self.IAU.state_dict(), "{}/iau.th".format(path))
+
+    def load_models(self, path):
+        self.mac.load_models(path)
+        # Not quite right but I don't want to save target networks
+        self.target_mac.load_models(path)
+        if self.mixer is not None:
+            self.mixer.load_state_dict(th.load("{}/mixer.th".format(path), map_location=lambda storage, loc: storage))
+        self.optimiser.load_state_dict(th.load("{}/opt.th".format(path), map_location=lambda storage, loc: storage))
+        self.IAU.load_state_dict(th.load("{}/iau.th".format(path), map_location=lambda storage, loc: storage))
+    
+    def rebuild_batch(self, batch):
+        state = batch["state"][:,:-1].float()
+        terminated = batch["terminated"][:, :-1].float()
+        bs = state.shape[0]
+        hilp_state = []
+        hilp_next_state = []
+        hilp_goal = []
+        hilp_reward = []
+        hilp_mask = []
+        for i in range(state.shape[0]):
+            avil_state_range = th.nonzero(terminated[i])[0][0] # 返回轨迹中的终止状态index
+            all_integers = np.arange(0, avil_state_range.cpu())   # 生成范围 [0, avil_state_range] 内的所有整数
+            selected_integers = np.random.choice(all_integers, size=self.args.hilp_sample_size, replace=True) # 从中随机选择 n 个可重复的整数
+            states = state[i][selected_integers] # 从轨迹中随机选择 n 个状态
+
+            rand = np.random.choice(all_integers, size=self.args.hilp_sample_size, replace=True)
+            next_goal_index = np.clip(selected_integers + 1, a_min=None, a_max=avil_state_range.item()) # 以下一时刻状态为goal的index
+            next_states = state[i][next_goal_index]
+            rand_goal_index = np.clip(selected_integers + rand, a_min=None, a_max=avil_state_range.item()) # 以往后任意时刻状态为goal的index
+            goal_indx = np.where(np.random.rand(self.args.hilp_sample_size) < self.args.p_nextgoal, next_goal_index, rand_goal_index) # 按概率选择goal模式
+            goals = state[i][goal_indx]
+
+            success = (selected_integers == goal_indx)
+            success_rewards = success.astype(float) * self.args.reward_scale + self.args.reward_shift
+            masks = (1.0 - success.astype(float))
+
+            hilp_state.append(states.cpu().detach().numpy())
+            hilp_next_state.append(next_states.cpu().detach().numpy())
+            hilp_goal.append(goals.cpu().detach().numpy())
+            hilp_reward.append(success_rewards)
+            hilp_mask.append(masks)
+        
+        hilp_state = th.tensor(hilp_state).reshape(bs * self.args.hilp_sample_size, -1).cuda()
+        hilp_next_state = th.tensor(hilp_next_state).reshape(bs * self.args.hilp_sample_size, -1).cuda()
+        hilp_goal = th.tensor(hilp_goal).reshape(bs * self.args.hilp_sample_size, -1).cuda()
+        hilp_reward = th.tensor(hilp_reward).reshape(bs * self.args.hilp_sample_size, -1).cuda()
+        hilp_mask = th.tensor(hilp_mask).reshape(bs * self.args.hilp_sample_size, -1).cuda()
+
+        return hilp_state, hilp_next_state, hilp_goal, hilp_reward, hilp_mask
+
+    def rebuild_diff_batch(self, batch, good_batch=False):
+        
+        state = batch["state"][:,:-1].float()
+        terminated = batch["terminated"][:, :-1].float().squeeze()
+        rewards = batch["reward"][:, :-1].float()
+        returns = batch["cur_return"][:, :-1].float()
+
+        # end_state_index = []
+        end_return = []
+        for i in range(state.shape[0]):
+            avil_state_range = th.nonzero(terminated[i])[0][0]
+            end_return.append(returns[i][avil_state_range].detach().cpu().numpy())
+        end_return = np.array(end_return).squeeze()
+        top_indices = np.argsort(end_return)[::-1][:8]
+
+        bs = state.shape[0]
+        diff_state = []
+        diff_goal = []
+        diff_return = []
+        over_num = 0
+        for i in range(state.shape[0]):
+            if i not in top_indices:
+                continue
+            avil_state_range = th.nonzero(terminated[i])[0][0] + 1 # 返回轨迹中的终止状态index
+            # print(avil_state_range)
+            start_index = int(avil_state_range * self.args.start_ratio)
+            if start_index < 2:
+                over_num += self.args.sample_size
+                continue
+            end_index = int(avil_state_range * self.args.end_ratio)
+
+            if (end_index - start_index)/self.args.horizon < 1:
+                over_num += self.args.sample_size
+                continue
+
+            all_integers = np.arange(0, start_index)   # 生成范围 [0, start_index] 内的所有整数
+            selected_integers = np.random.choice(all_integers, size=self.args.sample_size, replace=True) # 从中随机选择 n 个可重复的整数
+
+            # all_integers = np.arange(end_index, avil_state_range.cpu())   # 生成范围 [0, start_index] 内的所有整数
+            begin_index = int(avil_state_range * self.args.begin_ratio)
+            all_integers = np.arange(begin_index, end_index)
+            goal_index = np.random.choice(all_integers, size=self.args.sample_size, replace=True) # 从中随机选择 n 个可重复的整数
+            for j in range(self.args.sample_size):
+                inds = np.linspace(selected_integers[j], goal_index[j], self.args.horizon)
+                inds = np.floor(inds).astype(int)
+                goals = state[i][inds]
+                goals = normalize_states(to_numpy(goals), self.args.states_max,  self.args.states_min)
+                diff_goal.append(goals)
+
+                discount_return = 0
+                reward_array = rewards[i][selected_integers[j]:avil_state_range].cpu().numpy().squeeze()
+                discount_array = np.array([self.args.discount ** t for t in range(reward_array.shape[0])]).squeeze()
+                discount_return = (reward_array * discount_array).sum()
+                norm_return = discount_return * 5
+                diff_return.append(norm_return) 
+
+        x = th.tensor(diff_goal).reshape(8 * self.args.sample_size - over_num, self.args.horizon,-1).cuda().float()
+        diff_return = to_tensor(np.array(diff_return).reshape(8 * self.args.sample_size - over_num, 1)).float()
+        conditions = {0: x[:,0,:]}
+        return x, conditions, diff_return
+
+
+
+    def compute_value_loss(self, hilp_state, hilp_next_state, hilp_goal, hilp_reward, hilp_mask):
+        # masks are 0 if terminal, 1 otherwise
+        masks = 1.0 - hilp_reward
+        # rewards are 0 if terminal, -1 otherwise
+        hilp_reward = hilp_reward - 1.0
+        #to do
+        (next_v1, next_v2) = self.target_mac.embedding(hilp_next_state, hilp_goal)
+        next_v = th.min(next_v1, next_v2)
+        q = hilp_reward + self.args.discount * masks * next_v
+
+        #to do
+        (v1_t, v2_t) = self.target_mac.embedding(hilp_state, hilp_goal)
+        v_t = (v1_t + v2_t) / 2
+        adv = q - v_t
+
+        q1 = hilp_reward + self.args.discount * masks * next_v1
+        q2 = hilp_reward + self.args.discount * masks * next_v2
+        (v1, v2) = self.mac.embedding(hilp_state, hilp_goal)
+        v = (v1 + v2) / 2
+
+        value_loss1 = expectile_loss(adv, q1 - v1, self.args.expectile).mean()
+        value_loss2 = expectile_loss(adv, q2 - v2, self.args.expectile).mean()
+        value_loss = value_loss1 + value_loss2
+
+        return value_loss, {
+            'v max': v.max(),
+            'v min': v.min(),
+            'v mean': v.mean()
+            }
+    

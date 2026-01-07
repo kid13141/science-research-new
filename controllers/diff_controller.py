@@ -1,0 +1,151 @@
+from modules.agents import REGISTRY as agent_REGISTRY
+from modules import Hilp_Embedding, Factoring
+from components.action_selectors import REGISTRY as action_REGISTRY
+from diffuser.src.diffusion import GaussianDiffusion
+from diffuser.src.constructor import MLPnet
+import torch as th
+import numpy as np
+import copy
+# from modules.agents.guf_double_agent import RNNAgent2
+
+# This multi-agent controller shares parameters between agents
+class DiffMAC:
+    def __init__(self, scheme, groups,args):
+        self.n_agents = args.n_agents
+        self.args = args
+        input_shape = self._get_input_shape(scheme)
+        self.input_shape = input_shape
+        self._build_agents(input_shape)
+        self.agent_output_type = args.agent_output_type
+
+        self.action_selector = action_REGISTRY[args.action_selector](args)
+        self.embedding = Hilp_Embedding(args.state_shape, args)
+        self.hidden_states = None
+        self.loc_hidden_states = None
+
+        self.imagine_net = MLPnet(goal_dim = args.state_shape, cond_dim = args.state_shape).cuda()
+        self.diffusion_agent = GaussianDiffusion(model=self.imagine_net, observation_dim=args.state_shape, out_dim=args.state_shape, n_timesteps=args.n_timesteps).cuda()
+        if args.load_diffusion:
+            print("Loading Model!!")
+            self.load_diff_model("results/models/2025-08-11_19-20-01_diff_sc2_5m_vs_6m_v2/1900558")
+  
+    def select_actions(self, ep_batch, t_ep, t_env, goals, bs=slice(None), test_mode=False):
+        # Only select actions for the selected batch elements in bs
+        avail_actions = ep_batch["avail_actions"][:, t_ep]
+        agent_outputs,_= self.forward(ep_batch, t_ep, goals, test_mode=test_mode)
+        chosen_actions = self.action_selector.select_action(agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode)
+        return chosen_actions
+
+    def forward(self,ep_batch, t, goals, test_mode=False):
+        self.agent_inputs = self._build_inputs(ep_batch, t, goals)
+        avail_actions = ep_batch["avail_actions"][:, t]
+        agent_outs, self.hidden_states = self.agent(self.agent_inputs, self.hidden_states) # (32,5,7)
+
+        # Softmax the agent outputs if they're policy logits
+        if self.agent_output_type == "pi_logits":
+
+            if getattr(self.args, "mask_before_softmax", True):
+                # Make the logits for unavailable actions very negative to minimise their affect on the softmax
+                reshaped_avail_actions = avail_actions.reshape(ep_batch.batch_size * self.n_agents, -1)
+                agent_outs[reshaped_avail_actions == 0] = -1e10
+
+            agent_outs = th.nn.functional.softmax(agent_outs, dim=-1)
+            if not test_mode:
+                # Epsilon floor
+                epsilon_action_num = agent_outs.size(-1)
+                if getattr(self.args, "mask_before_softmax", True):
+                    # With probability epsilon, we will pick an available action uniformly
+                    epsilon_action_num = reshaped_avail_actions.sum(dim=1, keepdim=True).float()
+
+                agent_outs = ((1 - self.action_selector.epsilon) * agent_outs
+                               + th.ones_like(agent_outs) * self.action_selector.epsilon/epsilon_action_num)
+
+                if getattr(self.args, "mask_before_softmax", True):
+                    # Zero out the unavailable actions
+                    agent_outs[reshaped_avail_actions == 0] = 0.0
+        # q 值,hidden_state
+        return agent_outs.view(ep_batch["state"].shape[0], self.n_agents, -1), self.hidden_states.clone().detach()
+
+
+    def init_hidden(self, batch_size):
+        self.hidden_states = self.agent.init_hidden().unsqueeze(0).expand(batch_size, self.n_agents, -1)  # bav
+
+    def parameters(self):
+        return self.agent.parameters()
+    
+    
+    def load_state(self, other_mac):
+        self.agent.load_state_dict(other_mac.agent.state_dict())
+        self.embedding.load_state_dict(other_mac.embedding.state_dict())
+
+    def cuda(self):
+        self.agent.cuda()
+        self.embedding.cuda()
+
+
+    def save_models(self, path):
+        th.save(self.agent.state_dict(), "{}/agent.th".format(path))
+        th.save(self.embedding.state_dict(), "{}/embedding.th".format(path))
+        th.save(self.diffusion_agent.state_dict(), "{}/diffusion.th".format(path))
+
+        
+
+    def load_models(self, path):
+        self.agent.load_state_dict(th.load("{}/agent.th".format(path), map_location=lambda storage, loc: storage))
+        self.embedding.load_state_dict(th.load("{}/embedding.th".format(path), map_location=lambda storage, loc: storage))
+        self.diffusion_agent.load_state_dict(th.load("{}/diffusion.th".format(path), map_location=lambda storage, loc: storage))
+
+    def load_diff_model(self, path):
+        self.diffusion_agent.load_state_dict(th.load("{}/diffusion.th".format(path), map_location=lambda storage, loc: storage))
+
+
+    def _build_agents(self, input_shape):
+        self.agent = agent_REGISTRY[self.args.agent](input_shape, self.args)
+
+
+    def _build_inputs(self, batch, t, goals):
+        # Assumes homogenous agents with flat observations.
+        # Other MACs might want to e.g. delegate building inputs to each agent
+        bs = batch["state"].shape[0]
+        inputs = []
+        inputs.append(batch["obs"][:, t])  # b1av
+        if self.args.obs_last_action:
+            if t == 0:
+                inputs.append(th.zeros_like(batch["actions_onehot"][:, t]))
+            else:
+                inputs.append(batch["actions_onehot"][:, t-1])
+        if self.args.obs_agent_id:
+            inputs.append(th.eye(self.n_agents, device="cuda").unsqueeze(0).expand(bs, -1, -1))
+
+        inputs = th.cat([x.reshape(bs*self.n_agents, -1) for x in inputs], dim=1)
+        inputs = th.cat([inputs, goals.reshape(-1, goals.size(-1))], dim=-1)
+        return inputs
+    
+    def _build_loc_inputs(self,q_list, batch, t):
+        # Assumes homogenous agents with flat observations.
+        # Other MACs might want to e.g. delegate building inputs to each agent
+        bs = batch["state"].shape[0] 
+        inputs = []
+        inputs.append(batch["obs"][:, t])  # b1av 
+        
+        if self.args.obs_last_action:
+            if t == 0:
+                inputs.append(th.zeros_like(batch["actions_onehot"][:, t]))
+            else:
+                inputs.append(batch["actions_onehot"][:, t-1])
+        if self.args.obs_agent_id:
+            inputs.append(th.eye(self.n_agents, device="cuda").unsqueeze(0).expand(bs, -1, -1))
+
+        inputs.append(q_list)  #(32,5)
+        inputs = th.cat([x.reshape(bs*self.n_agents, -1) for x in inputs], dim=1)
+        return inputs    
+    
+
+    def _get_input_shape(self, scheme):
+        input_shape = scheme["obs"]["vshape"]
+        if self.args.obs_last_action:
+            input_shape += scheme["actions_onehot"]["vshape"][0]
+        if self.args.obs_agent_id:
+            input_shape += self.n_agents
+        input_shape += self.args.teammate_dim
+        return input_shape

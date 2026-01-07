@@ -1,0 +1,327 @@
+import datetime
+import os
+import pprint
+import time
+import threading
+import torch as th
+import json
+import sys
+from types import SimpleNamespace as SN
+from utils.logging import Logger
+from utils.timehelper import time_left, time_str
+from os.path import dirname, abspath
+from learners import REGISTRY as le_REGISTRY
+from runners import REGISTRY as r_REGISTRY
+from controllers import REGISTRY as mac_REGISTRY
+from components.episode_buffer import ReplayBuffer
+from components.transforms import OneHot
+from diffuser.src.diffusion import GaussianDiffusion
+from diffuser.src.constructor import Imagine_Net
+from os.path import dirname, abspath
+import numpy as np
+import copy as cp
+
+
+def run_gcrl(_run, _config, _log):
+
+    # check args sanity
+    _config = args_sanity_check(_config, _log)
+
+    args = SN(**_config)
+    args.device = "cuda" if args.use_cuda else "cpu"
+
+    # setup loggers
+    logger = Logger(_log)
+
+    _log.info("Experiment Parameters:")
+    experiment_params = pprint.pformat(_config,
+                                       indent=4,
+                                       width=1)
+    _log.info("\n\n" + experiment_params + "\n")
+
+    # configure tensorboard logger
+    if len(args.comment) > 0:
+        alg_name = '{}_{}'.format(args.name, args.comment)
+    else:
+        alg_name = args.name
+    if str(args.env).startswith('sc2'):
+        unique_token = "{}_{}_{}_{}".format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"), alg_name, args.env, args.env_args['map_name'])
+    else:
+        unique_token = "{}_{}_{}".format(datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"), alg_name, args.env)
+    
+    args.unique_token = unique_token
+    
+    if str(args.env).startswith('sc2'):
+        tb_logs_direc = os.path.join(dirname(dirname(abspath(__file__))), "results", "tb_logs", args.env, args.env_args['map_name'], alg_name)
+    else:
+        tb_logs_direc = os.path.join(dirname(dirname(abspath(__file__))), "results", "tb_logs", args.env, alg_name)
+    tb_exp_direc = os.path.join(tb_logs_direc, unique_token)
+    if args.use_tensorboard:
+        logger.setup_tb(tb_exp_direc)
+
+    # sacred is on by default
+    logger.setup_sacred(_run)
+
+    # Run and train
+    run_sequential(args=args, logger=logger)
+
+    if args.use_tensorboard:
+        if str(args.env).startswith('sc2'):
+            json_output_direc = os.path.join(dirname(dirname(abspath(__file__))), "results", args.env, args.env_args['map_name'], alg_name)
+        else:
+            json_output_direc = os.path.join(dirname(dirname(abspath(__file__))), "results", args.env, alg_name)
+        json_exp_direc = os.path.join(json_output_direc, unique_token + '.json')
+        print(f'Export tensorboard scalars at {tb_exp_direc} to json file {json_exp_direc}')
+        export_scalar_to_json(tb_exp_direc, json_output_direc, args)
+
+    # Clean up after finishing
+    print("Exiting Main")
+
+    print("Stopping all threads")
+    for t in threading.enumerate():
+        if t.name != "MainThread":
+            print("Thread {} is alive! Is daemon: {}".format(t.name, t.daemon))
+            t.join(timeout=1)
+            print("Thread joined")
+
+    print("Exiting script")
+
+    # Making sure framework really exits
+    os._exit(os.EX_OK)
+
+
+def evaluate_sequential(args, runner):
+
+    for _ in range(args.test_nepisode):
+        runner.run(test_mode=True)
+
+    if args.save_replay:
+        runner.save_replay()
+
+    runner.close_env()
+
+
+def save_one_buffer(args, save_buffer, env_name, from_start=False):
+    x_env_name = env_name
+    if from_start:
+        x_env_name += '_from_start/'
+    path_name = '../../buffer/' + x_env_name + '/buffer_' + str(args.save_buffer_id) + '/'
+    # if os.path.exists(path_name):
+    #     random_name = '../../buffer/' + x_env_name + '/buffer_' + str(random.randint(10, 1000)) + '/'
+    #     os.rename(path_name, random_name)
+    if not os.path.exists(path_name):
+        os.makedirs(path_name)
+    save_buffer.save(path_name)
+
+
+# Load pretrained diffusion model over (s_0, g) "/home/songshoucheng/GUF/src/diffuser/results/diffuser-2024-08-07-19-00-52.pt"
+def load_diffusion_model(args): 
+    with open(args.norm_path, "r") as json_file:
+        loaded_data = json.load(json_file)
+    args.states_max = np.array(loaded_data["states_max"])
+    args.states_min = np.array(loaded_data["states_min"])
+    goal_states_max = np.concatenate((args.states_max, args.states_max), -1)
+    model_path = args.diffusion_path
+    back_generator_network = Image_Net(observation_dim = args.state_shape*2, action_dim = args.n_actions, input_dim = args.state_shape*2+16, out_dim = args.state_shape*2 , t_dim = 16, hidden_dim=256).cuda()
+    diffusion_generator = GaussianDiffusion(back_generator_network, args.state_shape, args.n_actions, args.state_shape*2, goal_states_max, lambda_guide=1, n_timesteps=20).cuda()
+    diffusion_generator.load_state_dict(state_dict=th.load(model_path))
+    return diffusion_generator
+
+def run_sequential(args, logger):
+
+    # Init runner so we can get env info
+    runner = r_REGISTRY[args.runner](args=args, logger=logger)
+
+    # Set up schemes and groups here
+    env_info = runner.get_env_info()
+    args.episode_limit = env_info["episode_limit"]
+    args.n_agents = env_info["n_agents"]
+    args.n_actions = env_info["n_actions"]
+    args.state_shape = env_info["state_shape"]
+    if "unit_dim" in env_info:
+        args.unit_dim = env_info["unit_dim"]
+    
+    diffusion_agent = load_diffusion_model(args)
+
+    # Default/Base scheme
+    scheme = {
+        "state": {"vshape": env_info["state_shape"]},
+        "goal": {"vshape": env_info["state_shape"]},
+        "obs": {"vshape": env_info["obs_shape"], "group": "agents"},
+        "actions": {"vshape": (1,), "group": "agents", "dtype": th.long},
+        "avail_actions": {"vshape": (env_info["n_actions"],), "group": "agents", "dtype": th.int},
+        "reward": {"vshape": (1,)},
+        "exp_reward": {"vshape": (1,)},
+        "terminated": {"vshape": (1,), "dtype": th.uint8},
+    }
+    groups = {
+        "agents": args.n_agents
+    }
+    preprocess = {
+        "actions": ("actions_onehot", [OneHot(out_dim=args.n_actions)])
+    }
+
+    env_name = args.env
+    if env_name == 'sc2':
+        env_name += '/' + args.env_args['map_name']
+
+    buffer = ReplayBuffer(scheme, groups, args.buffer_size, env_info["episode_limit"] + 1,
+                          preprocess=preprocess,
+                          device="cpu" if args.buffer_cpu_only else args.device)
+
+    # if args.is_save_buffer:
+    #     buffer = ReplayBuffer(scheme, groups, args.buffer_size, env_info["episode_limit"] + 1,
+    #                       preprocess=preprocess,
+    #                       device="cpu" if args.buffer_cpu_only else args.device)
+
+    # if args.is_batch_rl:
+    #     assert (args.is_save_buffer == False)
+    #     x_env_name = env_name
+    #     if args.is_from_start:
+    #         x_env_name += '_from_start/'
+    #     path_name = '../../buffer/' + x_env_name + '/buffer_' + str(args.load_buffer_id) + '/'
+    #     assert (os.path.exists(path_name) == True)
+    #     buffer.load(path_name)
+
+    # Setup multiagent controller here
+    mac = mac_REGISTRY[args.mac](buffer.scheme, groups, args)
+
+    # Give runner the scheme
+    runner.setup(scheme=scheme, groups=groups, preprocess=preprocess, mac=mac)
+    runner.load_agent(diffusion_agent)
+
+    # Learner
+    learner = le_REGISTRY[args.learner](mac, buffer.scheme, logger, args)
+
+    if args.use_cuda:
+        learner.cuda()
+
+    if args.checkpoint_path != "":
+
+        timesteps = []
+        timestep_to_load = 0
+
+        if not os.path.isdir(args.checkpoint_path):
+            logger.console_logger.info("Checkpoint directiory {} doesn't exist".format(args.checkpoint_path))
+            return
+
+        # Go through all files in args.checkpoint_path
+        for name in os.listdir(args.checkpoint_path):
+            full_name = os.path.join(args.checkpoint_path, name)
+            # Check if they are dirs the names of which are numbers
+            if os.path.isdir(full_name) and name.isdigit():
+                timesteps.append(int(name))
+
+        if args.load_step == 0:
+            # choose the max timestep
+            timestep_to_load = max(timesteps)
+        else:
+            # choose the timestep closest to load_step
+            timestep_to_load = min(timesteps, key=lambda x: abs(x - args.load_step))
+
+        model_path = os.path.join(args.checkpoint_path, str(timestep_to_load))
+
+        logger.console_logger.info("Loading model from {}".format(model_path))
+        learner.load_models(model_path)
+        runner.t_env = timestep_to_load
+
+        if args.evaluate or args.save_replay:
+            evaluate_sequential(args, runner)
+            return
+
+    # start training
+    episode = 0
+    last_test_T = -args.test_interval - 1
+    last_log_T = 0
+    model_save_time = 0
+
+    start_time = time.time()
+    last_time = start_time
+
+    logger.console_logger.info("Beginning training for {} timesteps".format(args.t_max))
+
+    if args.env == 'matrix_game_1' or args.env == 'matrix_game_2' or args.env == 'matrix_game_3' \
+            or args.env == 'mmdp_game_1':
+        last_demo_T = -args.demo_interval - 1
+
+    while runner.t_env <= args.t_max:
+
+        # Run for a whole episode at a time
+        episode_batch = runner.run(test_mode=False)
+        buffer.insert_episode_batch(episode_batch)
+
+        if buffer.can_sample(args.batch_size):
+            episode_sample = buffer.sample(args.batch_size)
+
+            # Truncate batch to only filled timesteps
+            max_ep_t = episode_sample.max_t_filled()
+            episode_sample = episode_sample[:, :max_ep_t]
+
+            if episode_sample.device != args.device:
+                episode_sample.to(args.device)
+
+            learner.train(episode_sample, runner.t_env, episode)
+
+        # Execute test runs once in a while
+        n_test_runs = max(1, args.test_nepisode // runner.batch_size)
+        if (runner.t_env - last_test_T) / args.test_interval >= 1.0:
+
+            logger.console_logger.info("t_env: {} / {}".format(runner.t_env, args.t_max))
+            logger.console_logger.info("Estimated time left: {}. Time passed: {}".format(
+                time_left(last_time, last_test_T, runner.t_env, args.t_max), time_str(time.time() - start_time)))
+            last_time = time.time()
+
+            last_test_T = runner.t_env
+            for _ in range(n_test_runs):
+                runner.run(test_mode=True)
+
+        if args.save_model and (runner.t_env - model_save_time >= args.save_model_interval or model_save_time == 0):
+            model_save_time = runner.t_env
+            save_path = os.path.join(args.local_results_path, "models", args.unique_token, str(runner.t_env))
+            #"results/models/{}".format(unique_token)
+            os.makedirs(save_path, exist_ok=True)
+            logger.console_logger.info("Saving models to {}".format(save_path))
+
+            # learner should handle saving/loading -- delegate actor save/load to mac,
+            # use appropriate filenames to do critics, optimizer states
+            learner.save_models(save_path)
+
+        episode += args.batch_size_run
+
+        if (runner.t_env - last_log_T) >= args.log_interval:
+            logger.log_stat("episode", episode, runner.t_env)
+            logger.print_recent_stats()
+            last_log_T = runner.t_env
+
+    runner.close_env()
+    logger.console_logger.info("Finished Training")
+
+
+def args_sanity_check(config, _log):
+
+    # set CUDA args
+    # config["use_cuda"] = True # Use cuda whenever possible!
+    if config["use_cuda"] and not th.cuda.is_available():
+        config["use_cuda"] = False
+        _log.warning("CUDA flag use_cuda was switched OFF automatically because no CUDA devices are available!")
+
+    if config["test_nepisode"] < config["batch_size_run"]:
+        config["test_nepisode"] = config["batch_size_run"]
+    else:
+        config["test_nepisode"] = (config["test_nepisode"]//config["batch_size_run"]) * config["batch_size_run"]
+
+    return config
+
+def export_scalar_to_json(tensorboard_path, output_path, args):
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    os.makedirs(output_path, exist_ok=True)
+    filename = os.path.basename(tensorboard_path)
+    output_path = os.path.join(output_path, filename + '.json')
+    summary = EventAccumulator(tensorboard_path).Reload()
+    scalar_list = summary.Tags()['scalars']
+    stone_dict = {}
+    stone_dict['seed'] = args.seed
+    for scalar_name in scalar_list:
+        stone_dict['_'.join([scalar_name, 'T'])] = [ scalar.step for scalar in summary.Scalars(scalar_name) ]
+        stone_dict[scalar_name] = [ scalar.value for scalar in summary.Scalars(scalar_name) ]
+    json.dump(stone_dict, open(output_path, 'w'), ensure_ascii=False)
