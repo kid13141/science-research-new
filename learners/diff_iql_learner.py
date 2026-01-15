@@ -66,15 +66,6 @@ class DiffLearner:
 
         self.mixer = None
 
-
-        self.IAU = IAU(input_dim=self.args.rnn_hidden_dim+self.args.n_actions+self.args.teammate_dim,n_action=self.args.n_actions)
-
-
-        for param in self.IAU.parameters():
-            nn.init.constant_(param, 0)
-
-        self.params += list(self.IAU.parameters())
-
         if args.mixer is not None:
             if args.mixer == "vdn":
                 self.mixer = VDNMixer()
@@ -90,7 +81,6 @@ class DiffLearner:
 
         # a little wasteful to deepcopy (e.g. duplicates action selector), but should work for any MAC
         self.target_mac = copy.deepcopy(mac)
-        self.target_IAU = copy.deepcopy(self.IAU)
 
         self.log_stats_t = -self.args.learner_log_interval - 1
         self.last_diff_return = 1
@@ -201,9 +191,6 @@ class DiffLearner:
         # Pick the Q-Values for the actions taken by each agent
         chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)      
         # IAU_inputs = self._get_IAU_input(batch.batch_size, chosen_action_qvals.unsqueeze(3), hidden_states, split_goals) # chosen_action_qvals.shape = (32,200,5,1) hiddden_states.shape = (32,200,5,64) 
-        IAU_inputs = self._get_IAU_input(batch.batch_size, mac_out[:, :-1], hidden_states, split_goals)
-        IAU_out = self.IAU(IAU_inputs) 
-        IAU_out_action_qvals = th.gather(IAU_out, dim=3, index=actions) 
 
         # Calculate the Q-Values necessary for the target
         target_mac_out = []
@@ -225,27 +212,22 @@ class DiffLearner:
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach[:, 1:].max(dim=3, keepdim=True)[1] #the index of max q action 
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3) # (32,200,5)
+            target_max_qvals_loc = target_max_qvals.clone()
         
         else:
             target_max_qvals = target_mac_out.max(dim=3)[0]
 
-        # loc Q
-        target_IAU_inputs = self._get_IAU_input(batch.batch_size, mac_out_detach[:, 1:], target_hidden_states, split_goals)
-        target_IAU_out = self.target_IAU(target_IAU_inputs)
-        target_IAU_out_max_qvals = target_IAU_out.max(dim=3)[0]
-
-        mask_iau = mask.expand_as(factor_rewards)
-
-        IAUtargets = factor_rewards + self.args.gamma * mask_iau * target_IAU_out_max_qvals
-        td_error_iau = (IAU_out_action_qvals.squeeze(3) - IAUtargets.detach()) # (32,200,5)
-
-        iau_td_error = td_error_iau * mask_iau
-        loss_iau = (iau_td_error ** 2).sum() / (mask_iau.sum() + 1)
-
         # Mix
+        chosen_action_qvals_loc = chosen_action_qvals.clone()
         if self.mixer is not None:
             chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
             target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
+
+
+        # Q_loc
+        shape_targets = factor_rewards + args.gamma * (1 - terminated).expand_as(target_max_qvals_loc) * target_max_qvals_loc
+        td_error_shape = (chosen_action_qvals_loc - shape_targets.detach()) 
+        loss_shape = (td_error_shape ** 2).sum() / mask.expand_as(td_error_shape).sum()
 
         # Q_total
         targets = rewards + self.args.gamma * (1 - terminated) * target_max_qvals           
@@ -253,10 +235,10 @@ class DiffLearner:
 
         mask = mask.expand_as(td_error)
         masked_td_error = td_error * mask
-        
+
         # total loss
         loss = (masked_td_error ** 2).sum() / mask.sum() 
-        loss = loss + alpha*loss_iau
+        loss = loss + alpha*loss_shape
 
         # Optimise
         self.optimiser.zero_grad()
