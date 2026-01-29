@@ -127,10 +127,6 @@ class Hilp_Embedding(nn.Module):
         enemy_features = to_tensor(enemy_features)
         return self.state_embed_net_1(teammate_features, enemy_features), self.state_embed_net_2(teammate_features, enemy_features)
 
-    # def encode(self, inputs):
-    #     # for name, param in self.state_embed_net_1.named_parameters():
-    #     #     print(f"Parameter: {name}, DataType: {param.dtype}")
-    #     return self.state_embed_net_1(inputs), self.state_embed_net_2(inputs)
     
     def forward(self, state, goal):
         z_s_1, z_s_2 = self.encode(state)
@@ -140,6 +136,7 @@ class Hilp_Embedding(nn.Module):
         v1 = -torch.sqrt(torch.clamp(squared_dist_1, min=1e-6))
         v2 = -torch.sqrt(torch.clamp(squared_dist_2, min=1e-6))
         return v1, v2
+
 
 class Hilp_Multi_Embedding(nn.Module):
     def __init__(self, input_shape, args):
@@ -200,3 +197,99 @@ class Hilp_Multi_Embedding(nn.Module):
         v3 = -torch.sqrt(torch.clamp(squared_dist_3, min=1e-6))
         v4 = -torch.sqrt(torch.clamp(squared_dist_4, min=1e-6))
         return v1, v2, v3, v4
+
+
+class MLPNetwork(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        """
+        标准的 MLP 网络，用于将单一智能体的状态映射到潜在空间。
+        """
+        super(MLPNetwork, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Hilp2_Embedding(nn.Module):
+    def __init__(self, input_shape, args):
+        super(Hilp2_Embedding, self).__init__()
+        self.args = args
+        
+        # 输入维度仅为智能体自身的特征维度
+        self.net_1 = MLPNetwork( self.args.teammate_dim, args.vae_hidden_dim, args.latent_dim).to(args.device)
+        self.net_2 = MLPNetwork( self.args.teammate_dim, args.vae_hidden_dim, args.latent_dim).to(args.device)
+
+        self.optim_net = Adam(params=[
+            {'params': self.net_1.parameters()},
+            {'params': self.net_2.parameters()},
+        ], lr=args.lr, weight_decay=getattr(args, "weight_decay", 1e-5))
+
+
+    def split_global_vector(self, global_vector, N, M, teammate_dim, enemy_dim):
+        """
+        Split the global input vector into teammate and enemy feature tensors.
+
+        :param global_vector: Tensor of shape (batch_size, total_length), the global input vector.
+        :param N: Number of teammates.
+        :param M: Number of enemies.
+        :param teammate_dim: Dimensionality of each teammate's feature vector.
+        :param enemy_dim: Dimensionality of each enemy's feature vector.
+        :return: Tuple (teammates, enemies)
+            - teammates: Tensor of shape (batch_size, N, teammate_dim).
+            - enemies: Tensor of shape (batch_size, M, enemy_dim).
+        """
+        batch_size = global_vector.size(0)
+        total_length = global_vector.size(1)
+        
+        # Calculate expected length
+        expected_length = N * teammate_dim + M * enemy_dim
+        if total_length != expected_length:
+            raise ValueError(f"Global vector length ({total_length}) does not match the expected length ({expected_length}).")
+        
+        # Reshape the global vector
+        teammate_features = global_vector[:, :N * teammate_dim].view(batch_size, N, teammate_dim)
+        enemy_features = global_vector[:, N * teammate_dim:].view(batch_size, M, enemy_dim)
+        
+        return teammate_features, enemy_features
+
+    def encode(self, inputs):
+        """
+        编码过程：
+        1. 提取自我特征
+        2. 通过 MLP 映射到 latent space
+        """
+        # 1. 提取自我特征 (Batch, ..., Self_Dim)
+        teammate_features, enemy_features = self.split_global_vector(inputs,self.args.n_agents, self.args.n_enemy, self.args.teammate_dim, self.args.enemy_dim)
+        
+        # 2. 这里的 inputs 可能是 (Batch, N, Dim) 也可能是 (Batch*N, Dim)
+        # MLP 可以直接处理多维 Input，只要最后一维对得上
+        
+        z1 = self.net_1(teammate_features)
+        z2 = self.net_2(teammate_features)
+        
+        return z1, z2
+    
+    def forward(self, state, goal):
+        """
+        计算 HILP 势能
+        """
+        # 编码 (自动内部截取 Self 特征)
+        z_s_1, z_s_2 = self.encode(state)
+        z_g_1, z_g_2 = self.encode(goal)
+        
+        # 计算欧氏距离平方 ||z_s - z_g||^2
+        squared_dist_1 = ((z_s_1 - z_g_1) ** 2).sum(dim=-1)
+        squared_dist_2 = ((z_s_2 - z_g_2) ** 2).sum(dim=-1)
+        
+        # 计算势能 V = -distance
+        # 加 1e-6 防止梯度爆炸
+        v1 = -torch.sqrt(torch.clamp(squared_dist_1, min=1e-6))
+        v2 = -torch.sqrt(torch.clamp(squared_dist_2, min=1e-6))
+        
+        return v1, v2

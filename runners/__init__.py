@@ -18,3 +18,6 @@ REGISTRY["diff_total"] = Diff_Total_Runner
 from .diff_hilp_runner import Diff_Hilp_Runner
 REGISTRY["diff_hilp"] = Diff_Hilp_Runner
 
+from .diff_hilp2_runner import Diff_Hilp2_Runner
+REGISTRY["diff_hilp2"] = Diff_Hilp2_Runner
+
