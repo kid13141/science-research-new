@@ -165,9 +165,9 @@ class Diff_Total_Learner:
 
         for t in range(max_seq_length):
             agent_outs,hidden_states_outs = self.mac.forward(batch, t=t) 
-            mac_out.append(agent_outs)
+            mac_out.append(agent_outs) # (201,32,5,7)
 
-        mac_out = th.stack(mac_out, dim=1)  # Concat over time
+        mac_out = th.stack(mac_out, dim=1)  # Concat over time 
        
         # Pick the Q-Values for the actions taken by each agent
         chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)      

@@ -160,10 +160,7 @@ class Diff_Hilp2_Learner:
         # Calculate estimated Q-Values
         mac_out = []
         self.mac.init_hidden(state.shape[0])
-        split_goals = self.split_global_vector(goal_states[:, 0, :], self.args.n_agents, self.args.n_enemy, self.args.teammate_dim, self.args.enemy_dim)
-        split_goals_org = split_goals.clone()
-        split_goals = split_goals.unsqueeze(1).repeat(1, goal_states.shape[1], 1, 1)
-
+        
         for t in range(max_seq_length):
             agent_outs,hidden_states_outs = self.mac.forward(batch, t=t) 
             mac_out.append(agent_outs)
@@ -413,85 +410,85 @@ class Diff_Hilp2_Learner:
 
         return diff_state, diff_goal, diff_return
 
-    # def compute_value_loss(self, hilp_state, hilp_next_state, hilp_goal, hilp_reward, hilp_mask):
-    #     # masks are 0 if terminal, 1 otherwise
-    #     masks = 1.0 - hilp_reward
-    #     # rewards are 0 if terminal, -1 otherwise
-    #     hilp_reward = hilp_reward - 1.0
-
-
-    #     (next_v1, next_v2) = self.target_mac.embedding(hilp_next_state, hilp_goal)
-    #     next_v = th.min(next_v1, next_v2)
-    #     q = hilp_reward + self.args.discount * masks * next_v
-
-    #     (v1_t, v2_t) = self.target_mac.embedding(hilp_state, hilp_goal)
-    #     v_t = (v1_t + v2_t) / 2
-    #     adv = q - v_t
-
-    #     q1 = hilp_reward + self.args.discount * masks * next_v1
-    #     q2 = hilp_reward + self.args.discount * masks * next_v2
-    #     (v1, v2) = self.mac.embedding(hilp_state, hilp_goal)
-    #     v = (v1 + v2) / 2
-
-    #     value_loss1 = expectile_loss(adv, q1 - v1, self.args.expectile).mean()
-    #     value_loss2 = expectile_loss(adv, q2 - v2, self.args.expectile).mean()
-    #     value_loss = value_loss1 + value_loss2
-
-    #     return value_loss, {
-    #         'v max': v.max(),
-    #         'v min': v.min(),
-    #         'v mean': v.mean()
-    #         }
-
     def compute_value_loss(self, hilp_state, hilp_next_state, hilp_goal, hilp_reward, hilp_mask):
-        """
-        计算 HILP 网络的 Bellman Residual Loss (MSE)
-        对应论文公式: L = E[(r + gamma * V_target(s') - V(s))^2]
-        """
-        hilp_reward = hilp_reward.float()
-        hilp_mask = hilp_mask.float()
-        # --- 1. 奖励与掩码处理 (保持原逻辑) ---
-        # hilp_reward 输入时: 1.0 表示到达子目标, 0.0 表示行走中
-        
-        # 如果到达子目标 (reward=1), mask=0 (停止更新后续价值); 否则 mask=1
-        # 注意：还要结合环境本身的终止信号 (hilp_mask)
-        # 修正逻辑：masks = (1 - is_goal) * is_not_terminal
-        masks = (1.0 - hilp_reward) * hilp_mask
-        
-        # 构造 Dense Reward (负距离):
-        # Case A (到达): 1.0 - 1.0 = 0.0 (距离为0)
-        # Case B (行走): 0.0 - 1.0 = -1.0 (每步惩罚-1)
-        step_reward = hilp_reward - 1.0
+        # masks are 0 if terminal, 1 otherwise
+        masks = 1.0 - hilp_reward
+        # rewards are 0 if terminal, -1 otherwise
+        hilp_reward = hilp_reward - 1.0
 
-        # --- 2. 计算 TD Target (使用 Target Network) ---
-        with th.no_grad():
-            # 获取下一时刻的势能值
-            (next_v1, next_v2) = self.target_mac.embedding(hilp_next_state, hilp_goal)
-            
-            # Double Network 技巧：取最小值以缓解价值过估计
-            # 在度量学习中，取最小值意味着取"更远的距离估计" (更悲观/保守)，有助于鲁棒性
-            next_v = th.min(next_v1, next_v2)
-            
-            # 计算 TD 目标: y = r + gamma * mask * V(s')
-            target_v = step_reward + self.args.discount * masks * next_v
 
-        # --- 3. 计算 Current Value (使用 Online Network) ---
+        (next_v1, next_v2) = self.target_mac.embedding(hilp_next_state, hilp_goal)
+        next_v = th.min(next_v1, next_v2)
+        q = hilp_reward + self.args.discount * masks * next_v
+
+        (v1_t, v2_t) = self.target_mac.embedding(hilp_state, hilp_goal)
+        v_t = (v1_t + v2_t) / 2
+        adv = q - v_t
+
+        q1 = hilp_reward + self.args.discount * masks * next_v1
+        q2 = hilp_reward + self.args.discount * masks * next_v2
         (v1, v2) = self.mac.embedding(hilp_state, hilp_goal)
+        v = (v1 + v2) / 2
 
-        # --- 4. 计算 Loss (Standard MSE) ---
-        # 直接让当前网络的预测值逼近 TD Target
-        loss1 = F.mse_loss(v1, target_v)
-        loss2 = F.mse_loss(v2, target_v)
-        
-        value_loss = loss1 + loss2
+        value_loss1 = expectile_loss(adv, q1 - v1, self.args.expectile).mean()
+        value_loss2 = expectile_loss(adv, q2 - v2, self.args.expectile).mean()
+        value_loss = value_loss1 + value_loss2
 
-        # --- 5. 统计信息 (用于日志) ---
         return value_loss, {
-            'v_mean': (v1 + v2).detach().mean().item() / 2,
-            'v_max': (v1 + v2).detach().max().item() / 2,
-            'v_min': (v1 + v2).detach().min().item() / 2,
-            'hilp_loss': value_loss.item()
-        }
+            'v max': v.max(),
+            'v min': v.min(),
+            'v mean': v.mean()
+            }
+
+    # def compute_value_loss(self, hilp_state, hilp_next_state, hilp_goal, hilp_reward, hilp_mask):
+    #     """
+    #     计算 HILP 网络的 Bellman Residual Loss (MSE)
+    #     对应论文公式: L = E[(r + gamma * V_target(s') - V(s))^2]
+    #     """
+    #     hilp_reward = hilp_reward.float()
+    #     hilp_mask = hilp_mask.float()
+    #     # --- 1. 奖励与掩码处理 (保持原逻辑) ---
+    #     # hilp_reward 输入时: 1.0 表示到达子目标, 0.0 表示行走中
+        
+    #     # 如果到达子目标 (reward=1), mask=0 (停止更新后续价值); 否则 mask=1
+    #     # 注意：还要结合环境本身的终止信号 (hilp_mask)
+    #     # 修正逻辑：masks = (1 - is_goal) * is_not_terminal
+    #     masks = (1.0 - hilp_reward) * hilp_mask
+        
+    #     # 构造 Dense Reward (负距离):
+    #     # Case A (到达): 1.0 - 1.0 = 0.0 (距离为0)
+    #     # Case B (行走): 0.0 - 1.0 = -1.0 (每步惩罚-1)
+    #     step_reward = hilp_reward - 1.0
+
+    #     # --- 2. 计算 TD Target (使用 Target Network) ---
+    #     with th.no_grad():
+    #         # 获取下一时刻的势能值
+    #         (next_v1, next_v2) = self.target_mac.embedding(hilp_next_state, hilp_goal)
+            
+    #         # Double Network 技巧：取最小值以缓解价值过估计
+    #         # 在度量学习中，取最小值意味着取"更远的距离估计" (更悲观/保守)，有助于鲁棒性
+    #         next_v = th.min(next_v1, next_v2)
+            
+    #         # 计算 TD 目标: y = r + gamma * mask * V(s')
+    #         target_v = step_reward + self.args.discount * masks * next_v
+
+    #     # --- 3. 计算 Current Value (使用 Online Network) ---
+    #     (v1, v2) = self.mac.embedding(hilp_state, hilp_goal)
+
+    #     # --- 4. 计算 Loss (Standard MSE) ---
+    #     # 直接让当前网络的预测值逼近 TD Target
+    #     loss1 = F.mse_loss(v1, target_v)
+    #     loss2 = F.mse_loss(v2, target_v)
+        
+    #     value_loss = loss1 + loss2
+
+    #     # --- 5. 统计信息 (用于日志) ---
+    #     return value_loss, {
+    #         'v_mean': (v1 + v2).detach().mean().item() / 2,
+    #         'v_max': (v1 + v2).detach().max().item() / 2,
+    #         'v_min': (v1 + v2).detach().min().item() / 2,
+    #         'hilp_loss': value_loss.item()
+    #     }
     
 def concatenate_dicts(dict1, dict2):
     """
