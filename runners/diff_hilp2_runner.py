@@ -100,6 +100,8 @@ class Diff_Hilp2_Runner:
             # 要操作的文件夹路径
         folder_path = "/home/songshoucheng/GUF_2025/log_goals"
 
+        self.running_fr_max = 1e-4
+
         # 判断文件夹是否为空，不为空则清空文件夹
         if not is_dir_empty(folder_path):
             clear_non_empty_directory(folder_path)
@@ -280,8 +282,14 @@ class Diff_Hilp2_Runner:
             #     factor_reward = (init_dis - min_dis)* t / 100
             # else:
             #     factor_reward = 0
+
+            # 归一化factor_reward
             factor_reward = last_dis - cur_dis
-            factor_reward = torch.clip(factor_reward,min=0) * 0.5
+            factor_reward = torch.clip(factor_reward, min=0.0)
+            current_max = factor_reward.max().item()
+            self.running_fr_max = max(self.running_fr_max * 0.999, current_max)
+            factor_reward = factor_reward / (self.running_fr_max + 1e-8)
+            factor_reward = torch.clip(factor_reward, min=0.0, max=1.0)
 
             if (self.env.death_tracker_ally).sum() > 0 or terminated:
                 death = 1
@@ -296,7 +304,8 @@ class Diff_Hilp2_Runner:
                 "terminated": [(terminated != env_info.get("episode_limit", False),)],
                 "cur_return": [(episode_return,)],
                 "factor_reward": factor_reward,
-                "death": [(death,)]
+                "death": [(death,)],
+                "hilp_vals":cur_dis
             }
 
             self.batch.update(post_transition_data, ts=self.t)

@@ -142,6 +142,7 @@ class Diff_Hilp_Learner:
         # alpha = self.args.alpha
 
         # Diffusion Training
+        diff_return = th.tensor(0.0) # 默认值
         if self.args.pre_train_diff:
             diffusion_losses = []
             for i in range(self.args.diff_num):

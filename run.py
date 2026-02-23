@@ -126,6 +126,7 @@ def run_sequential(args, logger):
             "cur_return": {"vshape": (1,)},
             "multi_goals": {"vshape": (args.horizon, env_info["state_shape"])},
             "death": {"vshape": (1,)},
+            "hilp_vals": {"vshape": (1,), "group": "agents"}
         }
     else:
         scheme = {
@@ -142,6 +143,7 @@ def run_sequential(args, logger):
         "cur_return": {"vshape": (1,)},
         "death": {"vshape": (1,)},
         "total_reward": {"vshape": (1,)},
+        "hilp_vals": {"vshape": (1,), "group": "agents"}
         }
     groups = {
         "agents": args.n_agents

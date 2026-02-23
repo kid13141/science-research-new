@@ -23,6 +23,7 @@ class Diff_Exp_MAC:
         
         self.hidden_states = None
         self.loc_hidden_states = None
+        self.device = th.device('cuda' if args.use_cuda else 'cpu')
 
         self.imagine_net = MLPnet(goal_dim = args.state_shape, cond_dim = args.state_shape).cuda()
         self.diffusion_agent = GaussianDiffusion(model=self.imagine_net, observation_dim=args.state_shape, out_dim=args.state_shape, n_timesteps=args.n_timesteps).cuda()
@@ -30,16 +31,15 @@ class Diff_Exp_MAC:
     def select_actions(self, ep_batch, t_ep, t_env, bs=slice(None), test_mode=False):
         # Only select actions for the selected batch elements in bs
         avail_actions = ep_batch["avail_actions"][:, t_ep]
-        agent_outputs,_= self.forward(ep_batch, t_ep, test_mode=test_mode)
+        agent_outputs,_= self.forward(ep_batch, t_ep,test_mode=test_mode)
         chosen_actions = self.action_selector.select_action(agent_outputs[bs], avail_actions[bs], t_env, test_mode=test_mode)
         return chosen_actions
 
-    def forward(self,ep_batch, t, test_mode=False):
+    def forward(self,ep_batch, t,test_mode=False):
         self.agent_inputs = self._build_inputs(ep_batch, t)
         hilp_val = ep_batch["factor_reward"][:, t] # 结果: [Batch, Agents, 1]
         avail_actions = ep_batch["avail_actions"][:, t]
-        agent_outs, self.hidden_states = self.agent(self.agent_inputs, self.hidden_states, hilp_val) # (32,5,7)
-
+        agent_outs, self.hidden_states, self.latch_states = self.agent(self.agent_inputs , self.hidden_states, hilp_val, self.latch_states)
         # Softmax the agent outputs if they're policy logits
         if self.agent_output_type == "pi_logits":
 
@@ -68,6 +68,7 @@ class Diff_Exp_MAC:
 
     def init_hidden(self, batch_size):
         self.hidden_states = self.agent.init_hidden().unsqueeze(0).expand(batch_size, self.n_agents, -1)  # bav
+        self.latch_states = th.zeros(batch_size, self.n_agents, 1).to(self.device)
 
     def parameters(self):
         return self.agent.parameters()

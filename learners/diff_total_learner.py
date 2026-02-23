@@ -204,7 +204,7 @@ class Diff_Total_Learner:
         # Q_total
         targets = rewards + alpha * total_rewards + self.args.gamma * (1 - terminated) * target_max_qvals           
         td_error = (chosen_action_qvals - targets.detach())
-
+        
         mask = mask.expand_as(td_error)
         masked_td_error = td_error * mask
         

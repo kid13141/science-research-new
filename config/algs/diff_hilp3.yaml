@@ -6,9 +6,9 @@ epsilon_start: 1.0
 epsilon_finish: 0.05
 epsilon_anneal_time: 50000
 
-runner: "diff_exp"
-mac: "diff_total_mac"
-agent: "rnn" 
+runner: "diff_hilp2"
+mac: "diff_exp_mac"
+agent: "sgd_agent" 
 buffer_size: 5000
 
 # update the target network every {} episodes
@@ -16,7 +16,7 @@ target_update_interval: 200
 
 # use the Q_Learner to train
 agent_output_type: "q"
-learner: "diff_exp_learner"
+learner: "diff_hilp3_learner"
 double_q: True
 mixer: "qmix"
 mixing_embed_dim: 32
@@ -31,7 +31,7 @@ expectile: 0.95
 p_nextgoal: 0.5
 reward_scale: 1.0
 reward_shift: 0.0
-name: "diff_exp"
+name: "diff_hilp3"
 
 
 diff_num: 10
@@ -42,13 +42,13 @@ decay_rate_thed : 0.0
 
 start_ratio: 0.2 #初始状态上限
 end_ratio: 0.9 #目标状态上限
-begin_ratio: 0.7 #目标状态下限
+begin_ratio: 0.6 #目标状态下限
 
 post_exp_ratio: 0.1 #二阶段的奖励系数
 return_scale: 1.0 #目标收益的放缩系数
 alpha: 0.1
 
-use_hilp: False
+use_hilp: True
 swap_goals: False
 n_timesteps: 10
 
@@ -60,4 +60,3 @@ buffer_update_interval: 1 # 每多少个 Episode 更新一次 Buffer
 buffer_stride: 5          # 存入 Buffer 的采样间隔 (Stride)
 cl_weight: 0.01           # 对比学习 Loss 权重
 cl_temp: 0.1              # 对比学习 Temperature
-                                                                                                                                           

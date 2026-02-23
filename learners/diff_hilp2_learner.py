@@ -94,7 +94,7 @@ class Diff_Hilp2_Learner:
             self.mac.embedding.optim_net.step()
             self.logger.log_stat("v_max", value_info["v_max"], t_env)
             self.logger.log_stat("v_min", value_info["v_min"], t_env)
-            self.logger.log_stat("v_avg", value_info["v_mean"], t_env)
+            self.logger.log_stat("v_mean", value_info["v_mean"], t_env)
             self.logger.log_stat("value_loss", value_loss.item(), t_env)
     
     def split_global_vector(self, global_vector, N, M, teammate_dim, enemy_dim):
@@ -139,7 +139,6 @@ class Diff_Hilp2_Learner:
 
         # Get the threshold of first phase
         alpha = linear_decay(self.args.alpha, 0, 0.01, t_env)
-        # alpha = self.args.alpha
 
         # Diffusion Training
         diff_return = th.tensor(0.0) # 默认值
@@ -205,7 +204,6 @@ class Diff_Hilp2_Learner:
         shape_targets = factor_rewards + self.args.gamma * (1 - terminated).expand_as(target_max_qvals_loc) * target_max_qvals_loc
         td_error_shape = (chosen_action_qvals_loc - shape_targets.detach()) 
         loss_shape = (td_error_shape ** 2).sum() / mask.expand_as(td_error_shape).sum()
-
 
         # Q_total
         targets = rewards + self.args.gamma * (1 - terminated) * target_max_qvals           
@@ -435,9 +433,9 @@ class Diff_Hilp2_Learner:
         value_loss = value_loss1 + value_loss2
 
         return value_loss, {
-            'v max': v.max(),
-            'v min': v.min(),
-            'v mean': v.mean()
+            'v_max': v.max(),
+            'v_min': v.min(),
+            'v_mean': v.mean()
             }
 
     # def compute_value_loss(self, hilp_state, hilp_next_state, hilp_goal, hilp_reward, hilp_mask):

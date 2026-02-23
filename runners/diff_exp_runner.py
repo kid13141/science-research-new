@@ -296,7 +296,7 @@ class Diff_Exp_Runner:
                 "reward": [(reward,)],
                 "terminated": [(terminated != env_info.get("episode_limit", False),)],
                 "cur_return": [(episode_return,)],
-                "factor_reward": factor_reward,
+                # "factor_reward": factor_reward,
                 "death": [(death,)]
             }
 

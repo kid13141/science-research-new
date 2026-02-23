@@ -57,7 +57,7 @@ def compute_infonce_loss(c_t, d):
 
 
 
-class Diff_Exp_Learner:
+class Diff_Hilp3_Learner:
     def __init__(self, mac, scheme, logger, args):
         self.args = args
         self.mac = mac
@@ -142,7 +142,7 @@ class Diff_Exp_Learner:
         # Get the relevant quantities
         state = batch["state"][:,:-1]
         rewards = batch["reward"][:, :-1] # (32,200,1)
-        # factor_rewards = batch["factor_reward"].squeeze(-1)
+        factor_rewards = batch["factor_reward"]
         actions = batch["actions"][:, :-1]
         terminated = batch["terminated"][:, :-1].float()
         filled = batch["filled"][:, :-1].float()
@@ -150,6 +150,7 @@ class Diff_Exp_Learner:
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
         goal_states = batch["goal"][:,:-1]
+        hilp_vals = batch["hilp_vals"]
 
         # Get the threshold of first phase
         alpha = linear_decay(self.args.alpha, 0, 0.01, t_env)
@@ -171,20 +172,36 @@ class Diff_Exp_Learner:
 
         # Calculate estimated Q-Values
         mac_out = []
+        q_nav_out = []
+        q_act_out = []
         hidden_states_list = [] # 存储每一步的隐状态
+        current_latch_state = th.zeros(batch.batch_size * self.n_agents, 1).to(self.device)
         self.mac.init_hidden(state.shape[0])
 
         for t in range(max_seq_length):
-            agent_outs,hidden_states_outs = self.mac.forward(batch, t=t) 
-            hidden_states_outs = hidden_states_outs.view(batch["state"].shape[0], self.n_agents, -1)
+            agent_inputs = self.mac._build_inputs(batch, t=t)
+            hilp_val = hilp_vals[:,t]
+            agent_outs, q_nav, q_act, _, h_out_view, current_latch_state = self.mac.agent.get_dual_q(
+                agent_inputs, self.mac.hidden_states, hilp_val, current_latch_state, self.n_agents, batch.batch_size
+            )  
+            agent_outs = agent_outs.view(batch.batch_size,self.n_agents,-1)
+            q_nav = q_nav.view(batch.batch_size,self.n_agents,-1)
+            q_act = q_act.view(batch.batch_size,self.n_agents,-1)
+
             mac_out.append(agent_outs)
-            hidden_states_list.append(hidden_states_outs)
+            q_nav_out.append(q_nav)
+            q_act_out.append(q_act)
+            hidden_states_list.append(h_out_view)
 
         mac_out = th.stack(mac_out, dim=1)  # Concat over time
+        q_nav_out = th.stack(q_nav_out, dim=1)
+        q_act_out = th.stack(q_act_out, dim=1)
         hidden_states = th.stack(hidden_states_list, dim=1)[:, :-1]
 
         # Behavior Q (用于 QMIX)
-        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)   
+        chosen_action_qvals = th.gather(q_act_out[:, :-1], dim=3, index=actions).squeeze(3)  
+        # Navigation Q (用于独立 DQN)
+        chosen_action_q_nav = th.gather(q_nav_out[:, :-1], dim=3, index=actions).squeeze(3)
 
         # exp_reward
         z_team = self.team_encoder(hidden_states) # [Batch, Seq-1, Latent]
@@ -203,17 +220,29 @@ class Diff_Exp_Learner:
 
         # Calculate the Q-Values necessary for the target
         target_mac_out = []
+        target_q_nav_out = []
+        target_latch_state = th.zeros(batch.batch_size * self.n_agents, 1).to(self.device)
         self.target_mac.init_hidden(state.shape[0])
 
         for t in range(max_seq_length):
-            target_agent_outs,_= self.target_mac.forward(batch, t=t)
-            target_mac_out.append(target_agent_outs)
+            # target_agent_outs,_= self.target_mac.forward(batch, t=t)
+            target_inputs = self.target_mac._build_inputs(batch, t=t)
+            target_hilp_val = hilp_vals[:,t]
+            tgt_out, tgt_nav, _, _, _ ,target_latch_state = self.target_mac.agent.get_dual_q(
+                                target_inputs, self.target_mac.hidden_states, target_hilp_val,target_latch_state,self.n_agents, batch.batch_size
+                            )
+            tgt_out = tgt_out.view(batch.batch_size,self.n_agents,-1)
+            tgt_nav = tgt_nav.view(batch.batch_size,self.n_agents,-1)
+            target_mac_out.append(tgt_out)
+            target_q_nav_out.append(tgt_nav)
 
         # We don't need the first timesteps Q-Value estimate for calculating targets
         target_mac_out = th.stack(target_mac_out[1:], dim=1)  
-
+        target_q_nav_out = th.stack(target_q_nav_out[1:], dim=1) 
+        
         # Mask out unavailable actions
         target_mac_out[avail_actions[:, 1:] == 0] = -9999999
+        target_q_nav_out[avail_actions[:, 1:] == 0] = -9999999
 
         # Max over target Q-Values
         if self.args.double_q:
@@ -221,10 +250,16 @@ class Diff_Exp_Learner:
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach[:, 1:].max(dim=3, keepdim=True)[1] #the index of max q action 
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3) # (32,200,5)
-            target_max_qvals_loc = target_max_qvals.clone()
-        
+            # target_max_qvals = th.gather(target_q_nav_out, 3, cur_max_actions).squeeze(3) # (32,200,5)
+
+            q_nav_out_detach = q_nav_out.clone().detach()
+            q_nav_out_detach[avail_actions == 0] = -9999999
+            q_nav_cur_max_actions = q_nav_out_detach[:, 1:].max(dim=3, keepdim=True)[1] #the index of max q action 
+            target_max_q_nav = th.gather(target_q_nav_out, 3, q_nav_cur_max_actions).squeeze(3) # (32,200,5)
         else:
             target_max_qvals = target_mac_out.max(dim=3)[0]
+            # target_max_qvals = target_q_nav_out.max(dim=3)[0]
+            target_max_q_nav = target_q_nav_out.max(dim=3)[0]
 
         # Mix
         if self.mixer is not None:
@@ -232,13 +267,23 @@ class Diff_Exp_Learner:
             target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
 
         # Action Stream Loss 
-        act_targets = rewards + beta * r_diversity + self.args.gamma * (1 - terminated) * target_max_qvals            
+        # act_targets = rewards + beta * r_diversity + self.args.gamma * (1 - terminated) * target_max_qvals  
+        act_targets = rewards + beta * r_diversity + self.args.gamma * (1 - terminated) * target_max_qvals           
         td_error_act = (chosen_action_qvals - act_targets.detach())
-        mask = mask.expand_as(td_error_act)
-        td_error_act = td_error_act*mask
-        loss_act = (td_error_act ** 2 ).sum() / mask.sum()
+        act_mask = mask.expand_as(td_error_act)
+        td_error_act = td_error_act*act_mask
+        loss_act = (td_error_act ** 2 ).sum() / act_mask.sum()
 
+        # Q_nav
+        nav_targets = factor_rewards[:, :-1].squeeze(-1) + self.args.gamma * (1 - terminated).expand_as(target_max_q_nav) * target_max_q_nav
+        td_error_nav = (chosen_action_q_nav - nav_targets.detach()) 
+        nav_mask = mask.expand_as(td_error_nav)
+        td_error_nav = nav_mask*td_error_nav
+        loss_nav = (td_error_nav ** 2).sum() / nav_mask.sum()
+
+        lambda_nav = linear_decay(self.args.alpha, 0, 0.01, t_env)
         
+        # 计算对比学习 loss_cl
         # 1. 生成增强样本 (Data Augmentation)
         # 给 hidden_states 加噪声，制造同一轨迹的"另一个视图"
         noise = th.randn_like(hidden_states) * 0.1
@@ -273,11 +318,10 @@ class Diff_Exp_Learner:
         
         # 标签：对角线是正样本 (0,0), (1,1)...
         labels = th.arange(logits.shape[0]).to(self.device)
-        
         loss_cl = th.nn.CrossEntropyLoss()(logits, labels)
 
         # total loss
-        loss  = loss_act + self.args.cl_weight * loss_cl
+        loss = loss_act + lambda_nav * loss_nav + self.args.cl_weight * loss_cl
 
         # Optimise
         self.optimiser.zero_grad()
