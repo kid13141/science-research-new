@@ -6,8 +6,8 @@ epsilon_start: 1.0
 epsilon_finish: 0.05
 epsilon_anneal_time: 50000
 
-runner: "diff_hilp2"
-mac: "diff_exp_mac"
+runner: "diff_hilp3"
+mac: "diff_hilp3_mac"
 agent: "sgd_agent" 
 buffer_size: 5000
 
@@ -32,6 +32,7 @@ p_nextgoal: 0.5
 reward_scale: 1.0
 reward_shift: 0.0
 name: "diff_hilp3"
+
 
 
 diff_num: 10
@@ -60,3 +61,4 @@ buffer_update_interval: 1 # 每多少个 Episode 更新一次 Buffer
 buffer_stride: 5          # 存入 Buffer 的采样间隔 (Stride)
 cl_weight: 0.01           # 对比学习 Loss 权重
 cl_temp: 0.1              # 对比学习 Temperature
+gating_delta: 0.3

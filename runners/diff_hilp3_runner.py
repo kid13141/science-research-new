@@ -65,7 +65,7 @@ def phi_distance(mac,cur_states,goal_states):
         dist = torch.sqrt(torch.clamp(squared_dist, min=1e-6))
     return dist
 
-class Diff_Hilp2_Runner:
+class Diff_Hilp3_Runner:
 
     def __init__(self, args, logger):
         self.args = args
@@ -236,24 +236,27 @@ class Diff_Hilp2_Runner:
         self.mac.init_hidden(batch_size=self.batch_size)
         # thed = linear_decay(0.3, 0, 0.015, self.t_env)
         min_dis = 1000
+        current_mac_lock = torch.zeros(1, self.args.n_agents)
         while not terminated:
-            if self.t == 0:
-                cur_state = np.array([self.env.get_state()])
-                cur_state = torch.from_numpy(cur_state).cuda()
-                last_state = cur_state
+            cur_state = np.array([self.env.get_state()])
+            cur_state = torch.from_numpy(cur_state).cuda()
 
+            # 如果是第 0 步，通过 Diffusion 生成目标 goal_states
+            if self.t == 0:
                 start_state = np.array([self.env.get_state()])
                 norm_state = normalize_states(start_state, self.args.states_max, self.args.states_min)
                 norm_state_th = torch.tensor(norm_state).cuda()
                 returns = torch.ones(norm_state_th.shape[0], 1).cuda() * diff_return
 
                 with torch.no_grad():
-                    goal_states_th = self.mac.diffusion_agent.forward(cond=norm_state_th, returns=returns) # sample (s_0, s_sg) from diffusion model
-                    goal_states = non_normalized(goal_states_th[:,:self.args.state_shape].to('cpu').numpy(),self.args.states_max, self.args.states_min)
+                    goal_states_th = self.mac.diffusion_agent.forward(cond=norm_state_th, returns=returns)
+                    goal_states = non_normalized(goal_states_th[:,:self.args.state_shape].to('cpu').numpy(), self.args.states_max, self.args.states_min)
                     goal_states = torch.tensor(goal_states).cuda().float()
 
-                last_dis = phi_distance(self.mac, cur_state, goal_states)
-                init_dis = last_dis
+            # 计算当前状态距离 D_t，并归一化
+            cur_dis = phi_distance(self.mac, cur_state, goal_states)
+            self.running_max_dist = max(self.running_max_dist * 0.999, cur_dis.max().item())
+            norm_cur_dis = torch.clip(cur_dis / (self.running_max_dist + 1e-8), min=0.0, max=1.0)
 
             pre_transition_data = {
                 "state": [self.env.get_state()],
@@ -265,15 +268,14 @@ class Diff_Hilp2_Runner:
             self.batch.update(pre_transition_data, ts=self.t)
             
             #epsilon greedy action of each agent
-            actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env,test_mode=test_mode)
+            actions, current_mac_lock = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env,test_mode=test_mode,hilp_val=norm_cur_dis,lock=current_mac_lock)
             reward, terminated, env_info = self.env.step(actions[0])
-            
             episode_return += reward
 
-            cur_state = np.array([self.env.get_state()])
-            cur_state = torch.from_numpy(cur_state).cuda()
+            next_state = np.array([self.env.get_state()])
+            next_state = torch.from_numpy(next_state).cuda()
 
-            cur_dis = phi_distance(self.mac, cur_state, goal_states)
+            next_dis = phi_distance(self.mac, next_state, goal_states)
 
             # if cur_dis < min_dis:
             #     min_dis = cur_dis
@@ -284,27 +286,18 @@ class Diff_Hilp2_Runner:
             # else:
             #     factor_reward = 0
 
-            current_max = cur_dis.max().item()
-            self.running_max_dist = max(self.running_max_dist * 0.999, current_max)
-            norm_cur_dis = cur_dis / (self.running_max_dist + 1e-8)
-            norm_cur_dis = torch.clip(norm_cur_dis, min=0.0, max=1.0)
 
-            if self.t == 0:
-                norm_last_dis = norm_cur_dis # 第一步没有 last_dis，设为相等
-            else:
-                norm_last_dis = last_dis / (self.running_max_dist + 1e-8)
-                norm_last_dis = torch.clip(norm_last_dis, min=0.0, max=1.0)
+            self.running_max_dist = max(self.running_max_dist * 0.999, next_dis.max().item())
+            norm_next_dis = torch.clip(next_dis / (self.running_max_dist + 1e-8), min=0.0, max=1.0)
+          
 
-            # 越靠近目标，norm_cur_dis 越小，差值为正
-            factor_reward = norm_last_dis - norm_cur_dis
-            factor_reward = torch.clip(factor_reward, min=0.0) * 0.5 # 截断负数，乘以衰减系数
+            factor_reward = norm_cur_dis - norm_next_dis
+            factor_reward = torch.clip(factor_reward, min=0.0) * 0.5
 
             if (self.env.death_tracker_ally).sum() > 0 or terminated:
                 death = 1
             else:
                 death = 0
-            
-            last_dis = cur_dis
 
             post_transition_data = {
                 "actions": actions,
@@ -312,8 +305,9 @@ class Diff_Hilp2_Runner:
                 "terminated": [(terminated != env_info.get("episode_limit", False),)],
                 "cur_return": [(episode_return,)],
                 "factor_reward": factor_reward,
+                "lock_states":current_mac_lock,
+                "hilp_vals":norm_cur_dis,
                 "death": [(death,)],
-                "hilp_vals":norm_cur_dis
             }
 
             self.batch.update(post_transition_data, ts=self.t)
@@ -329,7 +323,7 @@ class Diff_Hilp2_Runner:
         self.batch.update(last_data, ts=self.t)
 
         # Select actions in the last stored state
-        actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode)
+        actions,_ = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode,hilp_val=norm_next_dis,lock=current_mac_lock)
         self.batch.update({"actions": actions}, ts=self.t)
 
         cur_stats = self.test_stats if test_mode else self.train_stats

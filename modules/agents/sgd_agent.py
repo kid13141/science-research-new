@@ -22,12 +22,68 @@ class SGDAgent(nn.Module):
     def init_hidden(self):
         return self.fc1.weight.new(1, self.args.rnn_hidden_dim).zero_()
 
-
-    def forward(self, inputs, hidden_state, hilp_val, latch_state):
-        # inputs: [Batch*Agents, Input_Dim] (PyMARL standard flattened input)
-        # hilp_val: [Batch*Agents, 1]
-        # latch_state: [Batch*Agents, 1] 记录上一时刻的锁定状态
+    # def forward(self, inputs, hidden_state, hilp_val, latch_state):
+    #     # inputs: [Batch*Agents, Input_Dim] (PyMARL standard flattened input)
+    #     # hilp_val: [Batch*Agents, 1]
+    #     # latch_state: [Batch*Agents, 1] 记录上一时刻的锁定状态
         
+    #     # --- A. Shared Backbone ---
+    #     x = F.relu(self.fc1(inputs))
+    #     h_in = hidden_state.reshape(-1, self.args.rnn_hidden_dim)
+    #     h_out = self.rnn(x, h_in)
+        
+    #     # --- B. Dual Heads ---
+    #     q_nav = self.q_nav_head(h_out)
+    #     q_act = self.q_act_head(h_out)
+        
+    #     # --- C. Hard Gating & Phase Latching ---
+    #     # 确保 hilp_val 维度对齐
+    #     if hilp_val.shape[0] != inputs.shape[0]:
+    #         hilp_val = hilp_val.reshape(-1, 1)
+            
+    #     # 1. 计算硬门控系数 hard_alpha (绝对的 0.0 或 1.0)
+    #     # 现在的 hilp_val 是距离 (越小越近)。当距离小于等于 delta 时，触发战斗 (1.0)
+    #     hard_alpha = (hilp_val <= self.gating_delta).float()
+
+    #     # 2. 相位锁定逻辑 (Phase Latching)
+    #     # 更新锁状态：只要当前判定该进入战斗 (hard_alpha=1)，或者历史已经是 1
+    #     # 锁就会永久闭合，保持 1.0 状态不掉落
+    #     new_latch_state = torch.max(latch_state, hard_alpha).detach() 
+
+    #     # --- D. Hard Switching (硬切换) ---
+    #     # 因为 new_latch_state 只有 0 或 1 两种值，这里实际上就是非黑即白的切换
+    #     # 0 的时候 100% 用 q_nav，1 的时候 100% 用 q_act
+    #     q_final = (1 - new_latch_state) * q_nav + new_latch_state * q_act
+        
+    #     # 注意：这里返回了 new_latch_state
+    #     return q_final, h_out, new_latch_state
+
+
+    # 用于 Learner 获取分头数据
+    # def get_dual_q(self, inputs, hidden_state, hilp_val, latch_state, n_agents, bs):
+    #     # 1. 前向传播提取特征
+    #     x = F.relu(self.fc1(inputs))
+    #     h_out = self.rnn(x, hidden_state.reshape(-1, self.args.rnn_hidden_dim))
+        
+    #     # 2. 计算双头 Q 值
+    #     q_act = self.q_act_head(h_out)
+    #     q_nav = self.q_nav_head(h_out.detach())
+        
+    #     # 3. 计算硬门控系数 hard_alpha (绝对的 0.0 或 1.0)
+    #     hilp_val_reshaped = hilp_val.reshape(-1, 1)
+    #     hard_alpha = (hilp_val_reshaped <= self.gating_delta).float()
+        
+    #     # 4. 相位锁定逻辑 (Phase Latching)
+    #     # 只要触发一次 1.0，立刻永久锁定为 1.0
+    #     new_latch_state = torch.max(latch_state, hard_alpha).detach() # 必须 detach 断开梯度
+        
+    #     # 5. 执行硬切换
+    #     q_final = (1 - new_latch_state) * q_nav + new_latch_state * q_act
+        
+    #     # 6. 返回结果 (注意：现在返回的 alpha 也就是 hard_alpha，它只有 0 或 1)
+    #     return q_final, q_nav, q_act, hard_alpha, h_out.view(bs, n_agents, -1), new_latch_state
+
+    def forward(self, inputs, hidden_state):
         # --- A. Shared Backbone ---
         x = F.relu(self.fc1(inputs))
         h_in = hidden_state.reshape(-1, self.args.rnn_hidden_dim)
@@ -36,62 +92,5 @@ class SGDAgent(nn.Module):
         # --- B. Dual Heads ---
         q_nav = self.q_nav_head(h_out)
         q_act = self.q_act_head(h_out)
-        
-        # --- C. Soft Gating & Phase Latching ---
-        # 确保 hilp_val 维度对齐
-        if hilp_val.shape[0] != inputs.shape[0]:
-            hilp_val = hilp_val.reshape(-1, 1)
-            
-        # 1. 计算原始门控系数 alpha
-        raw_gate = self.gating_k * (hilp_val - self.gating_delta)
-        alpha = torch.sigmoid(raw_gate) # (Batch*Agents, 1)
-
-        # 2. 相位锁定逻辑 (Phase Latching)
-        # 触发器：如果当前 alpha 大于 0.9，产生锁定信号
-        lock_signal = (alpha > 0.9).float()
-        
-        # 更新锁状态：保持 1.0 状态不掉落
-        new_latch_state = torch.max(latch_state, lock_signal).detach() 
-        
-        # 确定实际使用的 alpha
-        locked_alpha = torch.max(alpha, new_latch_state)
-
-        # --- D. Dynamic Blending ---
-        # 使用 locked_alpha 融合两个头的 Q 值
-        q_final = (1 - locked_alpha) * q_nav + locked_alpha * q_act
-        
-        # 注意：这里返回了 new_latch_state
-        return q_final, h_out, new_latch_state
-
-    # 用于 Learner 获取分头数据
-    def get_dual_q(self, inputs, hidden_state, hilp_val, latch_state, n_agents, bs):
-        # 1. 前向传播提取特征
-        x = F.relu(self.fc1(inputs))
-        h_out = self.rnn(x, hidden_state.reshape(-1, self.args.rnn_hidden_dim))
-        
-        # 2. 计算双头 Q 值
-        q_nav = self.q_nav_head(h_out)
-        q_act = self.q_act_head(h_out)
-        
-        # 3. 计算原始门控系数 alpha
-        raw_gate = self.gating_k * (hilp_val.reshape(-1, 1) - self.gating_delta)
-        alpha = torch.sigmoid(raw_gate)
-        
-        # 4. 相位锁定逻辑 (Phase Latching)
-        # 触发器：如果当前 alpha 大于 0.9，则产生 1.0 的锁定信号，否则为 0.0
-        lock_signal = (alpha > 0.9).float()
-        
-        # 更新锁状态：只要历史状态或当前信号有任意一个是 1.0，锁就会永久闭合 (保持 1.0)
-        new_latch_state = torch.max(latch_state, lock_signal).detach() # 必须 detach 断开梯度
-        
-        # 决定当前实际使用的 alpha: 
-        # 如果未锁定 (new_latch_state=0)，取原 alpha 进行平滑过渡；
-        # 如果已锁定 (new_latch_state=1)，取 1.0 (完全由 q_act 主导)。
-        locked_alpha = torch.max(alpha, new_latch_state)
-        
-        # 5. 执行决策融合
-        q_final = (1 - locked_alpha) * q_nav + locked_alpha * q_act
-        
-        # 6. 返回结果 (注意最后增加返回了 new_latch_state)
-        return q_final, q_nav, q_act, alpha, h_out.view(bs, n_agents, -1), new_latch_state
-
+    
+        return q_nav, q_act,h_out

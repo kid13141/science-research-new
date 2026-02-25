@@ -9,6 +9,9 @@ import numpy as np
 import utils.trajectory_encoder as tra_enc
 import torch.nn.functional as F
 import torch.nn as nn
+from modules.team_encoder import TeamEncoder
+from modules.history_buffer import HistoryBuffer
+import matplotlib.pyplot as plt
 
 def expectile_loss(adv, diff, expectile=0.7):
     weight = th.where(adv >= 0, expectile, (1 - expectile))
@@ -52,19 +55,19 @@ def compute_infonce_loss(c_t, d):
 
     return info_nce_loss
 
-class Diff_Hilp2_Learner:
+
+
+class Diff_Hilp3_Learner:
     def __init__(self, mac, scheme, logger, args):
         self.args = args
         self.mac = mac
         self.logger = logger
         self.n_agents = args.n_agents
         self.params = list(mac.parameters())
-
         self.diff_params = mac.imagine_net.parameters()
-
         self.last_target_update_episode = 0
-
         self.mixer = None
+        self.device = th.device('cuda' if args.use_cuda else 'cpu')
 
         if args.mixer is not None:
             if args.mixer == "vdn":
@@ -75,6 +78,17 @@ class Diff_Hilp2_Learner:
                 raise ValueError("Mixer {} not recognised.".format(args.mixer))
             self.params += list(self.mixer.parameters())
             self.target_mixer = copy.deepcopy(self.mixer)
+
+        # ---初始化team多样性模块 ---
+        self.team_encoder = TeamEncoder(args).to(self.device)
+        self.params += list(self.team_encoder.parameters())
+        
+        self.history_buffer = HistoryBuffer(
+            capacity=args.buffer_capacity, 
+            k=args.knn_k, 
+            latent_dim=args.team_latent_dim,
+            device=self.device
+        )
 
         self.optimiser = RMSprop(params=self.params, lr=args.lr, alpha=args.optim_alpha, eps=args.optim_eps)
         self.diff_optimiser = Adam(params=self.diff_params, lr=args.lr, weight_decay=getattr(args, "weight_decay", 0))
@@ -92,9 +106,9 @@ class Diff_Hilp2_Learner:
             self.mac.embedding.optim_net.zero_grad()
             value_loss.backward()
             self.mac.embedding.optim_net.step()
-            self.logger.log_stat("v_max", value_info["v_max"], t_env)
-            self.logger.log_stat("v_min", value_info["v_min"], t_env)
-            self.logger.log_stat("v_mean", value_info["v_mean"], t_env)
+            self.logger.log_stat("v_max", value_info["v max"].item(), t_env)
+            self.logger.log_stat("v_min", value_info["v min"].item(), t_env)
+            self.logger.log_stat("v_avg", value_info["v mean"].item(), t_env)
             self.logger.log_stat("value_loss", value_loss.item(), t_env)
     
     def split_global_vector(self, global_vector, N, M, teammate_dim, enemy_dim):
@@ -128,21 +142,17 @@ class Diff_Hilp2_Learner:
         # Get the relevant quantities
         state = batch["state"][:,:-1]
         rewards = batch["reward"][:, :-1] # (32,200,1)
-        factor_rewards = batch["factor_reward"][:,:-1].squeeze(-1)
+        factor_rewards = batch["factor_reward"]
         actions = batch["actions"][:, :-1]
         terminated = batch["terminated"][:, :-1].float()
         filled = batch["filled"][:, :-1].float()
         mask = batch["filled"][:, :-1].float()
-        death = batch["death"][:,:-1]
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
         goal_states = batch["goal"][:,:-1]
-
-        # Get the threshold of first phase
-        alpha = self.args.alpha
+        hilp_vals = batch["hilp_vals"]
 
         # Diffusion Training
-        diff_return = th.tensor(0.0) # 默认值
         if self.args.pre_train_diff:
             diffusion_losses = []
             for i in range(self.args.diff_num):
@@ -159,30 +169,84 @@ class Diff_Hilp2_Learner:
 
         # Calculate estimated Q-Values
         mac_out = []
-        self.mac.init_hidden(state.shape[0])
+        q_nav_out = []
+        q_act_out = []
+        hidden_states_list = [] # 存储每一步的隐状态
+        current_latch_state = th.zeros(batch.batch_size * self.n_agents, 1).to(self.device)
+        latch_states_list = []
         
+        self.mac.init_hidden(state.shape[0])
+
         for t in range(max_seq_length):
-            agent_outs,hidden_states_outs = self.mac.forward(batch, t=t) 
+            agent_inputs = self.mac._build_inputs(batch, t=t)
+            hilp_val = hilp_vals[:,t]
+            agent_outs, q_nav, q_act, _, h_out_view, current_latch_state = self.mac.agent.get_dual_q(
+                agent_inputs, self.mac.hidden_states, hilp_val, current_latch_state, self.n_agents, batch.batch_size
+            )  
+            agent_outs = agent_outs.view(batch.batch_size,self.n_agents,-1)
+            q_nav = q_nav.view(batch.batch_size,self.n_agents,-1)
+            q_act = q_act.view(batch.batch_size,self.n_agents,-1)
+            latch_view = current_latch_state.view(batch.batch_size, self.n_agents,-1)
+
             mac_out.append(agent_outs)
+            q_nav_out.append(q_nav)
+            q_act_out.append(q_act)
+            hidden_states_list.append(h_out_view)
+            latch_states_list.append(latch_view)
 
         mac_out = th.stack(mac_out, dim=1)  # Concat over time
-       
-        # Pick the Q-Values for the actions taken by each agent
-        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)      
+        q_nav_out = th.stack(q_nav_out, dim=1)
+        q_act_out = th.stack(q_act_out, dim=1)
+        hidden_states = th.stack(hidden_states_list, dim=1)[:, :-1]
+
+        # Behavior Q (用于 QMIX)
+        chosen_action_qvals = th.gather(q_act_out[:, :-1], dim=3, index=actions).squeeze(3)  
+        # Navigation Q (用于独立 DQN)
+        chosen_action_q_nav = th.gather(q_nav_out[:, :-1], dim=3, index=actions).squeeze(3)
+
+        latch_states_tensor = th.stack(latch_states_list, dim=1)[:, :-1].squeeze(3)
+        global_latch = latch_states_tensor.max(dim=2, keepdim=True)[0]
+
+        # exp_reward
+        z_team = self.team_encoder(hidden_states) # [Batch, Seq-1, Latent]
+
+        with th.no_grad():
+            r_diversity = self.history_buffer.compute_entropy_reward(z_team)
+            # 间隔更新 History Buffer
+            if episode_num % self.args.buffer_update_interval == 0:
+                # 展平并存入
+                flat_z = z_team.reshape(-1, self.args.team_latent_dim)
+                # 随机采样一部分存入，而不是全部 
+                stride = self.args.buffer_stride
+                self.history_buffer.add(flat_z[::stride].detach())
+        beta = max(0, self.args.diversity_beta * (1 - t_env / self.args.t_max))
+        
 
         # Calculate the Q-Values necessary for the target
         target_mac_out = []
+        target_q_nav_out = []
+        target_latch_state = th.zeros(batch.batch_size * self.n_agents, 1).to(self.device)
         self.target_mac.init_hidden(state.shape[0])
 
         for t in range(max_seq_length):
-            target_agent_outs,_= self.target_mac.forward(batch, t=t)
-            target_mac_out.append(target_agent_outs)
+            # target_agent_outs,_= self.target_mac.forward(batch, t=t)
+            target_inputs = self.target_mac._build_inputs(batch, t=t)
+            target_hilp_val = hilp_vals[:,t]
+            tgt_out, tgt_nav, _, _, _ ,target_latch_state = self.target_mac.agent.get_dual_q(
+                                target_inputs, self.target_mac.hidden_states, target_hilp_val,target_latch_state,self.n_agents, batch.batch_size
+                            )
+            tgt_out = tgt_out.view(batch.batch_size,self.n_agents,-1)
+            tgt_nav = tgt_nav.view(batch.batch_size,self.n_agents,-1)
+            target_mac_out.append(tgt_out)
+            target_q_nav_out.append(tgt_nav)
 
         # We don't need the first timesteps Q-Value estimate for calculating targets
         target_mac_out = th.stack(target_mac_out[1:], dim=1)  
+        target_q_nav_out = th.stack(target_q_nav_out[1:], dim=1) 
+        
         # Mask out unavailable actions
         target_mac_out[avail_actions[:, 1:] == 0] = -9999999
-
+        target_q_nav_out[avail_actions[:, 1:] == 0] = -9999999
 
         # Max over target Q-Values
         if self.args.double_q:
@@ -190,44 +254,86 @@ class Diff_Hilp2_Learner:
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach[:, 1:].max(dim=3, keepdim=True)[1] #the index of max q action 
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3) # (32,200,5)
-            target_max_qvals_loc = target_max_qvals.clone()
-        
+            # target_max_qvals = th.gather(target_q_nav_out, 3, cur_max_actions).squeeze(3) # (32,200,5)
+
+            q_nav_out_detach = q_nav_out.clone().detach()
+            q_nav_out_detach[avail_actions == 0] = -9999999
+            q_nav_cur_max_actions = q_nav_out_detach[:, 1:].max(dim=3, keepdim=True)[1] #the index of max q action 
+            target_max_q_nav = th.gather(target_q_nav_out, 3, q_nav_cur_max_actions).squeeze(3) # (32,200,5)
         else:
             target_max_qvals = target_mac_out.max(dim=3)[0]
+            # target_max_qvals = target_q_nav_out.max(dim=3)[0]
+            target_max_q_nav = target_q_nav_out.max(dim=3)[0]
 
         # Mix
-        chosen_action_qvals_loc = chosen_action_qvals.clone()
         if self.mixer is not None:
             chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
             target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
 
-        # Q_loc
-        shape_targets = factor_rewards + self.args.gamma * (1 - terminated).expand_as(target_max_qvals_loc) * target_max_qvals_loc
-        td_error_shape = (chosen_action_qvals_loc - shape_targets.detach()) 
-        loc_mask = mask.expand_as(td_error_shape)*(1-death)
-        masked_td_error_shape = td_error_shape * loc_mask 
-        loss_shape = (masked_td_error_shape ** 2).sum() / loc_mask.sum()
+        # Action Stream Loss 
+        # act_targets = rewards + beta * r_diversity + self.args.gamma * (1 - terminated) * target_max_qvals  
+        act_targets = rewards + beta * r_diversity + self.args.gamma * (1 - terminated) * target_max_qvals           
+        td_error_act = (chosen_action_qvals - act_targets.detach())
+        act_mask = mask.expand_as(td_error_act)
+        td_error_act = td_error_act*act_mask
+        loss_act = (td_error_act ** 2 ).sum() / act_mask.sum()
 
-        # Q_total
-        targets = rewards + self.args.gamma * (1 - terminated) * target_max_qvals         
-        td_error = (chosen_action_qvals - targets.detach())
-
-        mask = mask.expand_as(td_error)
-        masked_td_error = td_error * mask
+        # Q_nav
+        # latch_states_tensor 为 1 表示已进入战斗，所以 1 - latch 为 0，就会屏蔽此阶段的梯度
+        nav_phase_mask = 1.0 - latch_states_tensor
+        nav_targets = factor_rewards[:, :-1].squeeze(-1) + self.args.gamma * (1 - terminated).expand_as(target_max_q_nav) * target_max_q_nav
+        td_error_nav = (chosen_action_q_nav - nav_targets.detach()) 
+        nav_mask = mask.expand_as(td_error_nav)
+        combined_nav_mask = nav_mask * nav_phase_mask
+        td_error_nav = combined_nav_mask*td_error_nav
+        loss_nav = (td_error_nav ** 2).sum() / combined_nav_mask.sum()
+        lambda_nav = self.args.alpha
         
+        # 计算对比学习 loss_cl
+        # 1. 生成增强样本 (Data Augmentation)
+        # 给 hidden_states 加噪声，制造同一轨迹的"另一个视图"
+        noise = th.randn_like(hidden_states) * 0.1
+        z_team_aug = self.team_encoder(hidden_states + noise)
+        
+        # 2. 轨迹聚合 (Trajectory Pooling) - 关键步骤
+        # 我们需要处理 Padding，只对有效时间步求平均
+        # mask shape: [Batch, Seq, 1] -> 确保 mask 维度正确
+        mask_expanded = mask.expand_as(z_team) # [Batch, Seq, Latent]
+        
+        # 计算有效时间步的 sum
+        sum_z_team = (z_team * mask_expanded).sum(dim=1)         # [Batch, Latent]
+        sum_z_team_aug = (z_team_aug * mask_expanded).sum(dim=1) # [Batch, Latent]
+        
+        # 计算每个 Batch 的有效长度 (防止除以 0，加一个极小值)
+        seq_lengths = mask.sum(dim=1).expand(-1, self.args.team_latent_dim) # [Batch, Latent]
+        seq_lengths = th.clamp(seq_lengths, min=1.0)
+        
+        # 得到轨迹级的 Embedding [Batch, Latent]
+        traj_repr = sum_z_team / seq_lengths
+        traj_repr_aug = sum_z_team_aug / seq_lengths
+        
+        # 3. 归一化 (L2 Normalize) - 推荐操作
+        # 对比学习中，特征归一化通常能稳定训练
+        traj_repr = F.normalize(traj_repr, dim=1)
+        traj_repr_aug = F.normalize(traj_repr_aug, dim=1)
+
+        # 4. 计算 InfoNCE Loss (Batch Contrast)
+        # Logits shape: [Batch, Batch]
+        # (i, j) 元素代表：第 i 条轨迹 与 第 j 条增强轨迹 的相似度
+        logits = th.matmul(traj_repr, traj_repr_aug.T) / self.args.cl_temp
+        
+        # 标签：对角线是正样本 (0,0), (1,1)...
+        labels = th.arange(logits.shape[0]).to(self.device)
+        loss_cl = th.nn.CrossEntropyLoss()(logits, labels)
+
         # total loss
-        loss = (masked_td_error ** 2).sum() / mask.sum()
-        loss = loss + alpha*loss_shape
+        loss = loss_act + lambda_nav * loss_nav + self.args.cl_weight * loss_cl
 
         # Optimise
         self.optimiser.zero_grad()
         loss.backward()
         grad_norm = th.nn.utils.clip_grad_norm_(self.params, self.args.grad_norm_clip)
         self.optimiser.step()
-        
-        # Calculate exp_reward
-        factor_rewards = np.array(factor_rewards.cpu())
-        prior_exp_reward = factor_rewards.sum(-1).sum(-1).mean()
 
         if self.args.target_update_interval > 1.0 and (episode_num - self.last_target_update_episode) / self.args.target_update_interval >= 1.0:
             self._update_targets()
@@ -237,16 +343,14 @@ class Diff_Hilp2_Learner:
 
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
             self.logger.log_stat("loss", loss.item(), t_env)
-            # self.logger.log_stat("loss_shape", loss_shape.item(), t_env)
             if self.args.pre_train_diff:
                 self.logger.log_stat("diff_loss", diffusion_loss, t_env)
                 self.logger.log_stat("diff_return", diff_return.item(), t_env)
-            self.logger.log_stat("prior_exp_reward", prior_exp_reward.item(), t_env)
             self.logger.log_stat("grad_norm", grad_norm, t_env)
             mask_elems = mask.sum().item()
-            self.logger.log_stat("td_error_abs", (masked_td_error.abs().sum().item()/mask_elems), t_env)
+            # self.logger.log_stat("td_error_abs", (masked_td_error.abs().sum().item()/mask_elems), t_env)
             self.logger.log_stat("q_taken_mean", (chosen_action_qvals * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
-            self.logger.log_stat("target_mean", (targets * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
+            # self.logger.log_stat("target_mean", (targets * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
             self.log_stats_t = t_env
         return diff_return.item()
     
@@ -259,6 +363,7 @@ class Diff_Hilp2_Learner:
         return OAU_inputs
 
     def _build_inputs(self, batch, t):
+
         bs = batch.batch_size
         inputs = []
         inputs.append(batch["obs"][:, t])  # b1av
@@ -416,12 +521,12 @@ class Diff_Hilp2_Learner:
         masks = 1.0 - hilp_reward
         # rewards are 0 if terminal, -1 otherwise
         hilp_reward = hilp_reward - 1.0
-
-
+        #to do
         (next_v1, next_v2) = self.target_mac.embedding(hilp_next_state, hilp_goal)
         next_v = th.min(next_v1, next_v2)
         q = hilp_reward + self.args.discount * masks * next_v
 
+        #to do
         (v1_t, v2_t) = self.target_mac.embedding(hilp_state, hilp_goal)
         v_t = (v1_t + v2_t) / 2
         adv = q - v_t
@@ -436,60 +541,10 @@ class Diff_Hilp2_Learner:
         value_loss = value_loss1 + value_loss2
 
         return value_loss, {
-            'v_max': v.max(),
-            'v_min': v.min(),
-            'v_mean': v.mean()
+            'v max': v.max(),
+            'v min': v.min(),
+            'v mean': v.mean()
             }
-
-    # def compute_value_loss(self, hilp_state, hilp_next_state, hilp_goal, hilp_reward, hilp_mask):
-    #     """
-    #     计算 HILP 网络的 Bellman Residual Loss (MSE)
-    #     对应论文公式: L = E[(r + gamma * V_target(s') - V(s))^2]
-    #     """
-    #     hilp_reward = hilp_reward.float()
-    #     hilp_mask = hilp_mask.float()
-    #     # --- 1. 奖励与掩码处理 (保持原逻辑) ---
-    #     # hilp_reward 输入时: 1.0 表示到达子目标, 0.0 表示行走中
-        
-    #     # 如果到达子目标 (reward=1), mask=0 (停止更新后续价值); 否则 mask=1
-    #     # 注意：还要结合环境本身的终止信号 (hilp_mask)
-    #     # 修正逻辑：masks = (1 - is_goal) * is_not_terminal
-    #     masks = (1.0 - hilp_reward) * hilp_mask
-        
-    #     # 构造 Dense Reward (负距离):
-    #     # Case A (到达): 1.0 - 1.0 = 0.0 (距离为0)
-    #     # Case B (行走): 0.0 - 1.0 = -1.0 (每步惩罚-1)
-    #     step_reward = hilp_reward - 1.0
-
-    #     # --- 2. 计算 TD Target (使用 Target Network) ---
-    #     with th.no_grad():
-    #         # 获取下一时刻的势能值
-    #         (next_v1, next_v2) = self.target_mac.embedding(hilp_next_state, hilp_goal)
-            
-    #         # Double Network 技巧：取最小值以缓解价值过估计
-    #         # 在度量学习中，取最小值意味着取"更远的距离估计" (更悲观/保守)，有助于鲁棒性
-    #         next_v = th.min(next_v1, next_v2)
-            
-    #         # 计算 TD 目标: y = r + gamma * mask * V(s')
-    #         target_v = step_reward + self.args.discount * masks * next_v
-
-    #     # --- 3. 计算 Current Value (使用 Online Network) ---
-    #     (v1, v2) = self.mac.embedding(hilp_state, hilp_goal)
-
-    #     # --- 4. 计算 Loss (Standard MSE) ---
-    #     # 直接让当前网络的预测值逼近 TD Target
-    #     loss1 = F.mse_loss(v1, target_v)
-    #     loss2 = F.mse_loss(v2, target_v)
-        
-    #     value_loss = loss1 + loss2
-
-    #     # --- 5. 统计信息 (用于日志) ---
-    #     return value_loss, {
-    #         'v_mean': (v1 + v2).detach().mean().item() / 2,
-    #         'v_max': (v1 + v2).detach().max().item() / 2,
-    #         'v_min': (v1 + v2).detach().min().item() / 2,
-    #         'hilp_loss': value_loss.item()
-    #     }
     
 def concatenate_dicts(dict1, dict2):
     """

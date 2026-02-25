@@ -138,8 +138,8 @@ class Diff_Total_Learner:
         goal_states = batch["goal"][:,:-1]
 
         # Get the threshold of first phase
-        alpha = linear_decay(self.args.alpha, 0, 0.01, t_env)
-        # alpha = self.args.alpha
+        # alpha = linear_decay(self.args.alpha, 0, 0.01, t_env)
+        alpha = self.args.alpha
 
         # Diffusion Training
         if self.args.pre_train_diff:
