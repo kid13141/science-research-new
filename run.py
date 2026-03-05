@@ -10,6 +10,8 @@ from types import SimpleNamespace as SN
 from utils.logging import Logger
 from utils.timehelper import time_left, time_str
 from os.path import dirname, abspath
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
 from learners import REGISTRY as le_REGISTRY
 from runners import REGISTRY as r_REGISTRY
@@ -164,6 +166,7 @@ def run_sequential(args, logger):
 
     # Give runner the scheme
     runner.setup(scheme=scheme, groups=groups, preprocess=preprocess, mac=mac)
+    runner.buffer = buffer
 
     # Learner
     learner = le_REGISTRY[args.learner](mac, buffer.scheme, logger, args)
@@ -186,6 +189,37 @@ def run_sequential(args, logger):
             # Check if they are dirs the names of which are numbers
             if os.path.isdir(full_name) and name.isdigit():
                 timesteps.append(int(name))
+
+        timesteps.sort() # 确保步数从小到大排序
+
+        if getattr(args, "vis_state", False):
+            if len(timesteps) == 0:
+                logger.console_logger.info("未找到任何可用的检查点进行可视化！")
+                return
+            
+            # 自动挑选代表性的阶段（比如均匀抽取4个检查点：起步、发展、收敛、最终）
+            num_to_vis = min(4, len(timesteps))
+            indices = np.linspace(0, len(timesteps) - 1, num_to_vis, dtype=int)
+            selected_steps = [timesteps[i] for i in indices]
+            
+            # 构造输入给 visualize_trajectory_subplots_pdf 的字典
+            checkpoint_paths = {}
+            for step in selected_steps:
+                label = f"{step//1000}k" # 将 10000 转换为 '10k' 方便展示
+                checkpoint_paths[label] = os.path.join(args.checkpoint_path, str(step))
+            
+            logger.console_logger.info(f"开始执行 t-SNE 演变可视化，选取的检查点：{checkpoint_paths}")
+            
+            # 这里的 runner 必须设置 args.test_nepisode = 1，因为我们的函数目前只画一条轨迹
+            original_test_nepisode = args.test_nepisode
+            args.test_nepisode = 1 
+            
+            # 调用你的画图函数
+            save_pdf_name = f"tsne_state_{args.env}_{args.name}.pdf"
+            visualize_trajectory_subplots_pdf(runner, mac, checkpoint_paths, args, save_path=save_pdf_name)
+            
+            args.test_nepisode = original_test_nepisode # 恢复原设置
+            return  # 画完图直接退出程序
 
         if args.load_step == 0:
             # choose the max timestep
@@ -324,3 +358,132 @@ def truncate_trajectory(batch, T):
         if key in {"terminated"}:
             batch[key][:,-2] = 1
     return batch
+
+def visualize_trajectory_subplots_pdf(runner, mac, checkpoint_paths, args, save_path="tsne_evolution.pdf", step_interval=7):
+    """
+    预加载不同训练步数的模型，跑一条测试轨迹。
+    每条轨迹只提取一个固定的 goal，并且按 step_interval 间隔采样 state 以减少视觉杂乱。
+    用 t-SNE 进行全局降维，并在同一个 PDF 中分多个子图呈现不同阶段的走势。
+    """
+    all_states = []
+    single_goals = []  
+    traj_lengths = []
+    valid_labels = []
+    
+    # 强制开启 evaluate 模式
+    args.evaluate = True 
+
+    print("开始收集不同训练步数下的轨迹与目标数据...")
+    
+    for label, path in checkpoint_paths.items():
+        if not os.path.exists(path):
+            print(f"警告: 路径不存在 {path}，跳过该模型。")
+            continue
+            
+        # 加载模型权重
+        mac.load_models(path)
+        if hasattr(mac, 'load_diff_model'):
+            mac.load_diff_model(path)
+            
+        # 收集测试轨迹
+        states, goals, dis, exp_rewards = runner.run(test_mode=True)
+        
+        all_states.append(states)
+        single_goals.append(goals[0:1]) 
+        traj_lengths.append(states.shape[0])
+        valid_labels.append(label)
+        print(f"成功收集模型 [{label}] 的轨迹, 真实总长度: {states.shape[0]}")
+
+    n_stages = len(valid_labels)
+    if n_stages == 0:
+        print("没有成功收集到任何轨迹数据！")
+        return
+
+    # 拼接 states 和唯一的 goals 进行全局 t-SNE
+    combined_states = np.concatenate(all_states, axis=0)
+    combined_goals = np.concatenate(single_goals, axis=0) 
+    combined_all = np.concatenate([combined_states, combined_goals], axis=0)
+    
+    print(f"开始进行全局 t-SNE 降维计算，总数据量: {combined_all.shape}...")
+    tsne = TSNE(n_components=2, perplexity=min(30, combined_all.shape[0]-1), random_state=42)
+    all_2d = tsne.fit_transform(combined_all)
+    print("t-SNE 降维完成！")
+
+    # 获取降维后的全局坐标极值（用于对齐子图坐标系）
+    x_min, x_max = all_2d[:, 0].min(), all_2d[:, 0].max()
+    y_min, y_max = all_2d[:, 1].min(), all_2d[:, 1].max()
+    x_pad = (x_max - x_min) * 0.05
+    y_pad = (y_max - y_min) * 0.05
+
+    # 拆分 states_2d 和唯一的 goals_2d
+    num_states = combined_states.shape[0]
+    states_2d = all_2d[:num_states]
+    goals_2d = all_2d[num_states:] 
+
+    # 开始绘制子图 
+    fig, axes = plt.subplots(1, n_stages, figsize=(6 * n_stages, 6))
+    if n_stages == 1:
+        axes = [axes] 
+        
+    cmap = plt.get_cmap('tab10')
+    start_idx = 0
+    
+    for i in range(n_stages):
+        ax = axes[i]
+        length = traj_lengths[i]
+        end_idx = start_idx + length
+        label = valid_labels[i]
+        color = cmap(i % 10)
+        
+        # 提取当前步数完整的 2D state 和对应的单一 goal
+        traj_s_2d = states_2d[start_idx:end_idx]
+        goal_2d = goals_2d[i] 
+        
+        # 🌟 核心修改：按 step_interval (例如:5) 间隔采样轨迹
+        traj_s_2d_sub = traj_s_2d[::step_interval]
+        sub_length = len(traj_s_2d_sub)
+        
+        # 绘制间隔采样后的 State 轨迹连线
+        ax.plot(traj_s_2d_sub[:, 0], traj_s_2d_sub[:, 1], color=color, linewidth=2, alpha=0.5, zorder=2)
+        
+        # 绘制间隔采样后的 State 散点 (带渐变透明度)
+        alphas = np.linspace(0.2, 1.0, sub_length)
+        for j in range(sub_length):
+            ax.scatter(traj_s_2d_sub[j, 0], traj_s_2d_sub[j, 1], color=color, alpha=alphas[j], s=20, zorder=3)
+        
+        # 无论采样如何，始终精确标记轨迹的真实起点和真实终点
+        ax.scatter(traj_s_2d[0, 0], traj_s_2d[0, 1], c='green', s=150, marker='*', edgecolors='black', zorder=5, label='Start State')
+        ax.scatter(traj_s_2d[-1, 0], traj_s_2d[-1, 1], c='red', s=100, marker='X', edgecolors='black', zorder=5, label='End State')
+
+        # 绘制唯一的 Goal
+        ax.scatter(goal_2d[0], goal_2d[1], facecolor=color, edgecolor='black', 
+                   marker='^', s=250, alpha=0.9, zorder=6, label='Diffusion Goal')
+        
+        # 绘制一条连接 真实起点 与 Goal 的指引虚线
+        ax.plot([traj_s_2d[0, 0], goal_2d[0]], 
+                [traj_s_2d[0, 1], goal_2d[1]], 
+                color=color, linestyle='--', linewidth=1.5, alpha=0.6, zorder=1)
+
+        # 设置子图属性
+        ax.set_title(f'Training Stage: {label}', fontsize=14, fontweight='bold')
+        ax.set_xlabel('t-SNE Dim 1', fontsize=12)
+        if i == 0:
+            ax.set_ylabel('t-SNE Dim 2', fontsize=12)
+        
+        # 统一坐标轴
+        ax.set_xlim(x_min - x_pad, x_max + x_pad)
+        ax.set_ylim(y_min - y_pad, y_max + y_pad)
+        ax.grid(True, linestyle='--', alpha=0.5)
+        
+        if i == n_stages - 1:
+            ax.legend(loc='best', fontsize=10)
+            
+        start_idx = end_idx
+
+    plt.suptitle('Evolution of Agent State Trajectories vs Fixed Diffusion Goal', fontsize=18, y=1.05)
+    plt.tight_layout()
+    
+    # 保存为 PDF
+    plt.savefig(save_path, format='pdf', dpi=300, bbox_inches='tight')
+    print(f"\n✅ 可视化完成！已成功保存为高质量 PDF 文件: {save_path}")
+    plt.show()

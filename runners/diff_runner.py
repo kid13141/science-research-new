@@ -57,9 +57,9 @@ def linear_decay(initial_value, lower_bound, decay_rate, current_time):
 # 计算状态-目标的希尔伯特距离
 def phi_distance(mac,cur_states,goal_states):
     with torch.no_grad():
-        cur_phi_1, cur_phi_2 = mac.embedding.encode(cur_states) # Hilbert representation of sampled goal points
+        cur_phi_1, cur_phi_2 = mac.embedding.encode(cur_states) 
         cur_phi = (cur_phi_1 + cur_phi_2)/2
-        goal_phi_1, goal_phi_2 = mac.embedding.encode(goal_states) # Hilbert representation of sampled goal points
+        goal_phi_1, goal_phi_2 = mac.embedding.encode(goal_states) 
         goal_phi = (goal_phi_1 + goal_phi_2)/2
         squared_dist = ((cur_phi - goal_phi) ** 2).sum(axis=-1)
         dist = torch.sqrt(torch.clamp(squared_dist, min=1e-6))
@@ -73,7 +73,7 @@ class DiffRunner:
         self.batch_size = self.args.batch_size_run
         assert self.batch_size == 1
 
-
+        self.device = torch.device('cuda' if args.use_cuda else 'cpu')
         self.env = env_REGISTRY[self.args.env](**self.args.env_args)
         self.episode_limit = self.env.episode_limit
         self.t = 0
@@ -100,12 +100,16 @@ class DiffRunner:
             # 要操作的文件夹路径
         folder_path = "/home/songshoucheng/GUF_2025/log_goals"
 
+        self.running_fr_max = 1e-4
+        self.running_max_dist = 0.1 # 初始化为一个合理的小值
+
         # 判断文件夹是否为空，不为空则清空文件夹
         if not is_dir_empty(folder_path):
             clear_non_empty_directory(folder_path)
             print(f"文件夹 {folder_path} 已清空。")
         else:
             print(f"文件夹 {folder_path} 为空。")
+
 
     def setup(self, scheme, groups, preprocess, mac):
         self.new_batch = partial(EpisodeBatch, scheme, groups, self.batch_size, self.episode_limit + 1,
@@ -136,39 +140,6 @@ class DiffRunner:
         self.last_return = 0
         self.t = 0
 
-    def compute_influence(self, state, next_state, goal, total_reward, ally_alive, enemy_alive):
-        influences = []
-
-        for i in range(self.args.n_agents + self.args.n_enemy):
-            if i < self.args.n_agents:
-                start_index = i * self.args.teammate_dim
-                end_index = (i+1) * self.args.teammate_dim
-                alive = ally_alive[i]
-            else:
-                start_index = (i - self.args.n_agents) * self.args.enemy_dim + self.args.n_agents * self.args.teammate_dim
-                end_index = (i - self.args.n_agents + 1) * self.args.enemy_dim + self.args.n_agents * self.args.teammate_dim
-                alive = enemy_alive[i - self.args.n_agents]
-
-            org_state = state.clone()
-            state[0, start_index:end_index] = next_state[0, start_index:end_index]
-            mod_state = state
-
-            org_dist = phi_distance(self.mac, org_state, goal)
-            mod_dist = phi_distance(self.mac, mod_state, goal)
-
-            influence = (org_dist - mod_dist) * alive
-            influences.append(influence.item())
-
-        total_influence = sum(influences)
-        bias = (total_reward - total_influence)/(self.args.n_agents + self.args.n_enemy)
-        if(isinstance(bias, torch.Tensor)):
-            bias = bias.item()
-        influences = np.array(influences).squeeze()
-
-        exp_reward = influences + bias
-        exp_reward = exp_reward[:self.args.n_agents]
-        return exp_reward, exp_reward.sum().item()
-
     def split_global_vector(self, global_vector, N, M, teammate_dim, enemy_dim):
         """
         Split the global input vector into teammate and enemy feature tensors.
@@ -196,23 +167,14 @@ class DiffRunner:
         return teammate_features
 
     def split_distance(self, state_vector, goal_vector):
-        distances = np.linalg.norm(state_vector[:,:,2:4] - goal_vector[:,:,2:4], axis=-1, keepdims=True)
+        distances = np.linalg.norm(state_vector - goal_vector, axis=-1, keepdims=True)
         # distances = np.sum(np.abs(state_vector - goal_vector), -1)
         N = state_vector.shape[-1]
         sqrt_N = math.sqrt(N)
         distances /= sqrt_N
-        return distances
+        return torch.from_numpy(distances).float().to(self.args.device)
 
     def swap_dim(self, arr, dims, random_seed=None):
-        """
-        在第二维（N）内交换最后一维（dim）的前 x 个元素，不跨第一维（bs）交换
-        Args:
-            arr: 输入数组，形状 (bs, N, dim)
-            swap_ratio: 交换比例 (0~1)
-            random_seed: 随机种子（可选）
-        Returns:
-            交换后的数组
-        """
         if random_seed is not None:
             np.random.seed(random_seed)
         
@@ -247,6 +209,7 @@ class DiffRunner:
         stop = 1
         self.mac.init_hidden(batch_size=self.batch_size)
         # thed = linear_decay(0.3, 0, 0.015, self.t_env)
+        min_dis = 1000
         while not terminated:
             if self.t == 0:
                 cur_state = np.array([self.env.get_state()])
@@ -262,7 +225,7 @@ class DiffRunner:
                     goal_states_th = self.mac.diffusion_agent.forward(cond=norm_state_th, returns=returns) # sample (s_0, s_sg) from diffusion model
                     goal_states = non_normalized(goal_states_th[:,:self.args.state_shape].to('cpu').numpy(),self.args.states_max, self.args.states_min)
                     goal_states = torch.tensor(goal_states).cuda().float()
-            
+
                 split_goals = self.split_global_vector(goal_states, self.args.n_agents, self.args.n_enemy, self.args.teammate_dim, self.args.enemy_dim)
                 if self.args.swap_goals and random.random() < 0.1 and not test_mode:
                     split_goals = to_tensor(self.swap_dim(to_numpy(split_goals), self.args.teammate_dim - self.env.unit_type_bits))
@@ -271,7 +234,6 @@ class DiffRunner:
                 split_state = self.split_global_vector(cur_state, self.args.n_agents, self.args.n_enemy, self.args.teammate_dim, self.args.enemy_dim)
 
                 last_dis = self.split_distance(to_numpy(split_state), to_numpy(split_goals))
-                init_dis = last_dis
 
             pre_transition_data = {
                 "state": [self.env.get_state()],
@@ -283,7 +245,7 @@ class DiffRunner:
             self.batch.update(pre_transition_data, ts=self.t)
             
             #epsilon greedy action of each agent
-            actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, goals=split_goals,test_mode=test_mode)
+            actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env,test_mode=test_mode)
             reward, terminated, env_info = self.env.step(actions[0])
             
             episode_return += reward
@@ -292,8 +254,30 @@ class DiffRunner:
             split_cur_state = self.split_global_vector(to_tensor(cur_state), self.args.n_agents, self.args.n_enemy, self.args.teammate_dim, self.args.enemy_dim)
             cur_dis = self.split_distance(to_numpy(split_cur_state), to_numpy(split_goals))
 
-            factor_reward = last_dis - cur_dis
-            factor_reward = np.clip(factor_reward, 0, None) * 0.5
+
+            # if cur_dis < min_dis:
+            #     min_dis = cur_dis
+            #     t = self.t
+
+            # if terminated and self.t_env > 5e4:
+            #     factor_reward = (init_dis - min_dis)* t / 100
+            # else:
+            #     factor_reward = 0
+
+            current_max = cur_dis.max().item()
+            self.running_max_dist = max(self.running_max_dist * 0.999, current_max)
+            norm_cur_dis = cur_dis / (self.running_max_dist + 1e-8)
+            norm_cur_dis = torch.clip(norm_cur_dis, min=0.0, max=1.0)
+
+            if self.t == 0:
+                norm_last_dis = norm_cur_dis # 第一步没有 last_dis，设为相等
+            else:
+                norm_last_dis = last_dis / (self.running_max_dist + 1e-8)
+                norm_last_dis = torch.clip(norm_last_dis, min=0.0, max=1.0)
+
+            # 越靠近目标，norm_cur_dis 越小，差值为正
+            factor_reward = norm_last_dis - norm_cur_dis
+            factor_reward = torch.clip(factor_reward, min=0.0) * 0.5 # 截断负数，乘以衰减系数
 
             if (self.env.death_tracker_ally).sum() > 0 or terminated:
                 death = 1
@@ -308,7 +292,8 @@ class DiffRunner:
                 "terminated": [(terminated != env_info.get("episode_limit", False),)],
                 "cur_return": [(episode_return,)],
                 "factor_reward": factor_reward,
-                "death": [(death,)]
+                "death": [(death,)],
+                "hilp_vals":norm_cur_dis
             }
 
             self.batch.update(post_transition_data, ts=self.t)
@@ -324,7 +309,7 @@ class DiffRunner:
         self.batch.update(last_data, ts=self.t)
 
         # Select actions in the last stored state
-        actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, goals=split_goals,test_mode=test_mode)
+        actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode)
         self.batch.update({"actions": actions}, ts=self.t)
 
         cur_stats = self.test_stats if test_mode else self.train_stats
@@ -369,6 +354,7 @@ class DiffRunner:
         self.logger.log_stat(prefix + "return_mean", np.mean(returns), self.t_env)
         self.logger.log_stat(prefix + "return_median", np.median(returns), self.t_env)
         self.logger.log_stat(prefix + "return_std", np.std(returns), self.t_env)
+
         returns.clear()
 
         for k, v in stats.items():

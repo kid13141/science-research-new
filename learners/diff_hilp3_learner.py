@@ -178,7 +178,7 @@ class Diff_Hilp3_Learner:
         self.mac.init_hidden(state.shape[0])
 
         for t in range(max_seq_length):
-            q_nav, q_act,h_out = self.mac.forward(batch, t=t)  
+            q_act,q_nav,h_out = self.mac.forward(batch, t=t)  
             q_nav_out.append(q_nav)
             q_act_out.append(q_act)
             hidden_states_list.append(h_out)
@@ -247,8 +247,12 @@ class Diff_Hilp3_Learner:
             chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
             target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
 
+        
+        threshold = self.n_agents-2
+        new_lock = (lock_states.sum(dim=-1, keepdim=True) >= threshold).float()  # [bs, seq, 1]
+
         # Action Stream Loss 
-        act_targets = rewards + beta * r_diversity + self.args.gamma * (1 - terminated) * target_max_qvals           
+        act_targets = rewards + beta * r_diversity*new_lock + self.args.gamma * (1 - terminated) * target_max_qvals           
         td_error_act = (chosen_action_qvals - act_targets.detach())
         act_mask = mask.expand_as(td_error_act)
         td_error_act = td_error_act*act_mask

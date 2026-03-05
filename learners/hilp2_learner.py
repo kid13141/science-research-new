@@ -52,7 +52,7 @@ def compute_infonce_loss(c_t, d):
 
     return info_nce_loss
 
-class DiffLearner:
+class Hilp2_Learner:
     def __init__(self, mac, scheme, logger, args):
         self.args = args
         self.mac = mac
@@ -142,20 +142,20 @@ class DiffLearner:
         alpha = self.args.alpha
 
         # Diffusion Training
-        diff_return = th.tensor(0.0) # 默认值
-        if self.args.pre_train_diff:
-            diffusion_losses = []
-            for i in range(self.args.diff_num):
-                diff_state, diff_goal, diff_return = self.rebuild_diff_batch(batch)
-                x = th.cat([diff_goal, diff_state], dim=-1)
-                loss = self.mac.diffusion_agent.loss(x, diff_state, diff_return)
-                self.diff_optimiser.zero_grad()
-                loss.backward()
-                self.diff_optimiser.step()
-                diffusion_losses.append(loss.item())
-            diffusion_loss = np.array(diffusion_losses).mean(-1).item()
-            diff_return = diff_return.detach().cpu().max()
-            self.last_diff_return = diff_return
+        # diff_return = th.tensor(0.0) # 默认值
+        # if self.args.pre_train_diff:
+        #     diffusion_losses = []
+        #     for i in range(self.args.diff_num):
+        #         diff_state, diff_goal, diff_return = self.rebuild_diff_batch(batch)
+        #         x = th.cat([diff_goal, diff_state], dim=-1)
+        #         loss = self.mac.diffusion_agent.loss(x, diff_state, diff_return)
+        #         self.diff_optimiser.zero_grad()
+        #         loss.backward()
+        #         self.diff_optimiser.step()
+        #         diffusion_losses.append(loss.item())
+        #     diffusion_loss = np.array(diffusion_losses).mean(-1).item()
+        #     diff_return = diff_return.detach().cpu().max()
+        #     self.last_diff_return = diff_return
 
         # Calculate estimated Q-Values
         mac_out = []
@@ -238,9 +238,9 @@ class DiffLearner:
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
             self.logger.log_stat("loss", loss.item(), t_env)
             # self.logger.log_stat("loss_shape", loss_shape.item(), t_env)
-            if self.args.pre_train_diff:
-                self.logger.log_stat("diff_loss", diffusion_loss, t_env)
-                self.logger.log_stat("diff_return", diff_return.item(), t_env)
+            # if self.args.pre_train_diff:
+            #     self.logger.log_stat("diff_loss", diffusion_loss, t_env)
+            #     self.logger.log_stat("diff_return", diff_return.item(), t_env)
             self.logger.log_stat("prior_exp_reward", prior_exp_reward.item(), t_env)
             self.logger.log_stat("grad_norm", grad_norm, t_env)
             mask_elems = mask.sum().item()
@@ -248,7 +248,7 @@ class DiffLearner:
             self.logger.log_stat("q_taken_mean", (chosen_action_qvals * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
             self.logger.log_stat("target_mean", (targets * mask).sum().item()/(mask_elems * self.args.n_agents), t_env)
             self.log_stats_t = t_env
-        return diff_return.item()
+        return None
     
     def _get_IAU_input(self, size, action_values, encoded, goals):
         IAU_inputs = th.cat((action_values,encoded, goals),dim=-1)

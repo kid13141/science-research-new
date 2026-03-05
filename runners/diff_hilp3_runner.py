@@ -236,7 +236,7 @@ class Diff_Hilp3_Runner:
         self.mac.init_hidden(batch_size=self.batch_size)
         # thed = linear_decay(0.3, 0, 0.015, self.t_env)
         min_dis = 1000
-        current_mac_lock = torch.zeros(1, self.args.n_agents)
+        current_mac_lock = torch.zeros(1, self.args.n_agents).cuda()
         while not terminated:
             cur_state = np.array([self.env.get_state()])
             cur_state = torch.from_numpy(cur_state).cuda()
@@ -258,6 +258,11 @@ class Diff_Hilp3_Runner:
             self.running_max_dist = max(self.running_max_dist * 0.999, cur_dis.max().item())
             norm_cur_dis = torch.clip(cur_dis / (self.running_max_dist + 1e-8), min=0.0, max=1.0)
 
+            gating_delta = getattr(self.args, "gating_delta", 0.5) 
+            hard_alpha = (norm_cur_dis <= gating_delta).float() 
+            hard_alpha_expanded = hard_alpha.view(1, -1).expand(1, self.args.n_agents)
+            current_mac_lock = torch.max(current_mac_lock, hard_alpha_expanded).detach()
+
             pre_transition_data = {
                 "state": [self.env.get_state()],
                 "goal": [goal_states.detach().cpu().numpy()],
@@ -268,7 +273,8 @@ class Diff_Hilp3_Runner:
             self.batch.update(pre_transition_data, ts=self.t)
             
             #epsilon greedy action of each agent
-            actions, current_mac_lock = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env,test_mode=test_mode,hilp_val=norm_cur_dis,lock=current_mac_lock)
+            actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env,test_mode=test_mode)
+            # actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env,test_mode=test_mode)
             reward, terminated, env_info = self.env.step(actions[0])
             episode_return += reward
 
@@ -307,7 +313,7 @@ class Diff_Hilp3_Runner:
                 "factor_reward": factor_reward,
                 "lock_states":current_mac_lock,
                 "hilp_vals":norm_cur_dis,
-                "death": [(death,)],
+                "death": [(death,)]
             }
 
             self.batch.update(post_transition_data, ts=self.t)
@@ -323,7 +329,8 @@ class Diff_Hilp3_Runner:
         self.batch.update(last_data, ts=self.t)
 
         # Select actions in the last stored state
-        actions,_ = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode,hilp_val=norm_next_dis,lock=current_mac_lock)
+        # actions,_ = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env, test_mode=test_mode,hilp_val=norm_next_dis,lock=current_mac_lock)
+        actions = self.mac.select_actions(self.batch, t_ep=self.t, t_env=self.t_env,test_mode=test_mode)
         self.batch.update({"actions": actions}, ts=self.t)
 
         cur_stats = self.test_stats if test_mode else self.train_stats

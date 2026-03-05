@@ -56,8 +56,7 @@ def compute_infonce_loss(c_t, d):
     return info_nce_loss
 
 
-
-class Diff_Hilp3_Learner:
+class Diff_Hilp4_Learner:
     def __init__(self, mac, scheme, logger, args):
         self.args = args
         self.mac = mac
@@ -69,15 +68,25 @@ class Diff_Hilp3_Learner:
         self.mixer = None
         self.device = th.device('cuda' if args.use_cuda else 'cpu')
 
+        self.IAU_exp = IAU(input_dim=65, n_action=args.n_actions)
+        self.IAU_nav = IAU(input_dim=65, n_action=args.n_actions)
+
+        self.params += list(self.IAU_exp.parameters())
+        self.params += list(self.IAU_nav.parameters())
+
         if args.mixer is not None:
             if args.mixer == "vdn":
                 self.mixer = VDNMixer()
             elif args.mixer == "qmix":
                 self.mixer = QMixer(args)
+                self.mixer_exp = QMixer(args)
             else:
                 raise ValueError("Mixer {} not recognised.".format(args.mixer))
             self.params += list(self.mixer.parameters())
+            self.params += list(self.mixer_exp.parameters())
             self.target_mixer = copy.deepcopy(self.mixer)
+            self.target_mixer_exp = copy.deepcopy(self.mixer_exp)
+        
 
         # ---初始化team多样性模块 ---
         self.team_encoder = TeamEncoder(args).to(self.device)
@@ -95,7 +104,8 @@ class Diff_Hilp3_Learner:
 
         # a little wasteful to deepcopy (e.g. duplicates action selector), but should work for any MAC
         self.target_mac = copy.deepcopy(mac)
-
+        self.target_IAU_exp = copy.deepcopy(self.IAU_exp)
+        self.target_IAU_nav = copy.deepcopy(self.IAU_nav)
         self.log_stats_t = -self.args.learner_log_interval - 1
         self.last_diff_return = 1
 
@@ -142,7 +152,7 @@ class Diff_Hilp3_Learner:
         # Get the relevant quantities
         state = batch["state"][:,:-1]
         rewards = batch["reward"][:, :-1] # (32,200,1)
-        factor_rewards = batch["factor_reward"]
+        factor_rewards = batch["factor_reward"][:,:-1]
         actions = batch["actions"][:, :-1]
         terminated = batch["terminated"][:, :-1].float()
         filled = batch["filled"][:, :-1].float()
@@ -151,6 +161,8 @@ class Diff_Hilp3_Learner:
         avail_actions = batch["avail_actions"]
         goal_states = batch["goal"][:,:-1]
         hilp_vals = batch["hilp_vals"]
+        lock_states = batch["lock_states"][:,:-1].squeeze(-1)
+        death = batch["death"][:,:-1]
 
         # Diffusion Training
         if self.args.pre_train_diff:
@@ -169,47 +181,31 @@ class Diff_Hilp3_Learner:
 
         # Calculate estimated Q-Values
         mac_out = []
-        q_nav_out = []
-        q_act_out = []
+        # mac_out_nav = []
         hidden_states_list = [] # 存储每一步的隐状态
-        current_latch_state = th.zeros(batch.batch_size * self.n_agents, 1).to(self.device)
-        latch_states_list = []
         
         self.mac.init_hidden(state.shape[0])
 
         for t in range(max_seq_length):
-            agent_inputs = self.mac._build_inputs(batch, t=t)
-            hilp_val = hilp_vals[:,t]
-            agent_outs, q_nav, q_act, _, h_out_view, current_latch_state = self.mac.agent.get_dual_q(
-                agent_inputs, self.mac.hidden_states, hilp_val, current_latch_state, self.n_agents, batch.batch_size
-            )  
-            agent_outs = agent_outs.view(batch.batch_size,self.n_agents,-1)
-            q_nav = q_nav.view(batch.batch_size,self.n_agents,-1)
-            q_act = q_act.view(batch.batch_size,self.n_agents,-1)
-            latch_view = current_latch_state.view(batch.batch_size, self.n_agents,-1)
+            # agent_outs,agent_out_nav,h1,h2 = self.mac.forward(batch, t=t) 
+            # mac_out.append(agent_outs)
+            # mac_out_nav.append(agent_out_nav)
+            # hidden_states_list.append(h1.view(batch.batch_size, self.args.n_agents, -1))
 
+            agent_outs,hidden_states_outs = self.mac.forward(batch, t=t) 
+            hidden_states_outs = hidden_states_outs.view(batch["state"].shape[0], self.n_agents, -1)
             mac_out.append(agent_outs)
-            q_nav_out.append(q_nav)
-            q_act_out.append(q_act)
-            hidden_states_list.append(h_out_view)
-            latch_states_list.append(latch_view)
+            hidden_states_list.append(hidden_states_outs)
 
-        mac_out = th.stack(mac_out, dim=1)  # Concat over time
-        q_nav_out = th.stack(q_nav_out, dim=1)
-        q_act_out = th.stack(q_act_out, dim=1)
+        mac_out = th.stack(mac_out, dim=1)
+        # mac_out_nav = th.stack(mac_out_nav, dim=1)
         hidden_states = th.stack(hidden_states_list, dim=1)[:, :-1]
 
-        # Behavior Q (用于 QMIX)
-        chosen_action_qvals = th.gather(q_act_out[:, :-1], dim=3, index=actions).squeeze(3)  
-        # Navigation Q (用于独立 DQN)
-        chosen_action_q_nav = th.gather(q_nav_out[:, :-1], dim=3, index=actions).squeeze(3)
-
-        latch_states_tensor = th.stack(latch_states_list, dim=1)[:, :-1].squeeze(3)
-        global_latch = latch_states_tensor.max(dim=2, keepdim=True)[0]
+        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)  
+        # chosen_action_qvals_nav = th.gather(mac_out_nav[:, :-1], dim=3, index=actions).squeeze(3) 
 
         # exp_reward
         z_team = self.team_encoder(hidden_states) # [Batch, Seq-1, Latent]
-
         with th.no_grad():
             r_diversity = self.history_buffer.compute_entropy_reward(z_team)
             # 间隔更新 History Buffer
@@ -219,75 +215,110 @@ class Diff_Hilp3_Learner:
                 # 随机采样一部分存入，而不是全部 
                 stride = self.args.buffer_stride
                 self.history_buffer.add(flat_z[::stride].detach())
-        beta = max(0, self.args.diversity_beta * (1 - t_env / self.args.t_max))
+
+        # beta = max(0, self.args.diversity_beta * (1 - t_env / self.args.t_max))
         
+
+        IAU_nav_inputs = self._get_IAU_nav_input(chosen_action_qvals,hidden_states)
+        IAU_nav_out = self.IAU_nav(IAU_nav_inputs) 
+        IAU_nav_out_action_qvals = th.gather(IAU_nav_out, dim=3, index=actions)
+
+        IAU_exp_inputs = self._get_IAU_exp_input(chosen_action_qvals,hidden_states)
+        IAU_exp_out = self.IAU_exp(IAU_exp_inputs) 
+        IAU_exp_out_action_qvals = th.gather(IAU_exp_out, dim=3, index=actions)
 
         # Calculate the Q-Values necessary for the target
         target_mac_out = []
-        target_q_nav_out = []
-        target_latch_state = th.zeros(batch.batch_size * self.n_agents, 1).to(self.device)
+        # target_mac_out_nav = []
         self.target_mac.init_hidden(state.shape[0])
 
         for t in range(max_seq_length):
-            # target_agent_outs,_= self.target_mac.forward(batch, t=t)
-            target_inputs = self.target_mac._build_inputs(batch, t=t)
-            target_hilp_val = hilp_vals[:,t]
-            tgt_out, tgt_nav, _, _, _ ,target_latch_state = self.target_mac.agent.get_dual_q(
-                                target_inputs, self.target_mac.hidden_states, target_hilp_val,target_latch_state,self.n_agents, batch.batch_size
-                            )
-            tgt_out = tgt_out.view(batch.batch_size,self.n_agents,-1)
-            tgt_nav = tgt_nav.view(batch.batch_size,self.n_agents,-1)
-            target_mac_out.append(tgt_out)
-            target_q_nav_out.append(tgt_nav)
+            # t_q1, t_q2, _, _ = self.target_mac.forward(batch, t=t)
+            # target_mac_out.append(t_q1)
+            # target_mac_out_nav.append(t_q2)
+            target_agent_outs,_= self.target_mac.forward(batch, t=t)
+            target_mac_out.append(target_agent_outs)
 
         # We don't need the first timesteps Q-Value estimate for calculating targets
-        target_mac_out = th.stack(target_mac_out[1:], dim=1)  
-        target_q_nav_out = th.stack(target_q_nav_out[1:], dim=1) 
+        target_mac_out = th.stack(target_mac_out[1:], dim=1) 
+        # target_mac_out_nav = th.stack(target_mac_out_nav[1:], dim=1)  
         
         # Mask out unavailable actions
         target_mac_out[avail_actions[:, 1:] == 0] = -9999999
-        target_q_nav_out[avail_actions[:, 1:] == 0] = -9999999
+        # target_mac_out_nav[avail_actions[:, 1:] == 0] = -9999999
+    
 
         # Max over target Q-Values
         if self.args.double_q:
-            mac_out_detach = mac_out.clone().detach()
-            mac_out_detach[avail_actions == 0] = -9999999
-            cur_max_actions = mac_out_detach[:, 1:].max(dim=3, keepdim=True)[1] #the index of max q action 
-            target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3) # (32,200,5)
-            # target_max_qvals = th.gather(target_q_nav_out, 3, cur_max_actions).squeeze(3) # (32,200,5)
-
-            q_nav_out_detach = q_nav_out.clone().detach()
-            q_nav_out_detach[avail_actions == 0] = -9999999
-            q_nav_cur_max_actions = q_nav_out_detach[:, 1:].max(dim=3, keepdim=True)[1] #the index of max q action 
-            target_max_q_nav = th.gather(target_q_nav_out, 3, q_nav_cur_max_actions).squeeze(3) # (32,200,5)
+            # 使用当前网络的 q_act 选择动作，作用于 target_q1
+            cur_max_actions = mac_out.clone().detach()
+            cur_max_actions[avail_actions == 0] = -9999999
+            max_actions_ids = cur_max_actions[:,1:].max(dim=3, keepdim=True)[1]
+            target_max_qvals = th.gather(target_mac_out, 3, max_actions_ids).squeeze(3)
+            
+            # 使用当前网络的 q_nav 选择动作，作用于 target_q2
+            # cur_max_actions_nav = mac_out_nav.clone().detach()
+            # cur_max_actions_nav[avail_actions == 0] = -9999999
+            # max_actions_ids_nav = cur_max_actions_nav[:,1:].max(dim=3, keepdim=True)[1]
+            # target_max_qvals_nav = th.gather(target_mac_out_nav, 3, max_actions_ids_nav).squeeze(3)
         else:
             target_max_qvals = target_mac_out.max(dim=3)[0]
-            # target_max_qvals = target_q_nav_out.max(dim=3)[0]
-            target_max_q_nav = target_q_nav_out.max(dim=3)[0]
+            # target_max_qvals_nav = target_mac_out_nav.max(dim=3)[0]
+
+        target_IAU_nav_inputs = self._get_IAU_nav_input(target_max_qvals, hidden_states)
+        target_IAU_nav_out = self.target_IAU_nav(target_IAU_nav_inputs)
+        target_IAU_nav_out_max_qvals = target_IAU_nav_out.max(dim=3)[0]
+
+        target_IAU_exp_inputs = self._get_IAU_exp_input(target_max_qvals, hidden_states)
+        target_IAU_exp_out = self.target_IAU_exp(target_IAU_exp_inputs)
+        target_IAU_exp_out_max_qvals = target_IAU_exp_out.max(dim=3)[0]
 
         # Mix
+        # chosen_action_qvals_loc = chosen_action_qvals.clone()
         if self.mixer is not None:
             chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
             target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
 
+            chosen_action_qvals_exp = self.mixer_exp(IAU_exp_out_action_qvals, batch["state"][:, :-1])
+            target_max_qvals_exp = self.target_mixer_exp(target_IAU_exp_out_max_qvals, batch["state"][:, 1:])
+
+        threshold = self.n_agents*3/4
+        new_lock = (lock_states.sum(dim=-1, keepdim=True) >= threshold).float()  # [bs, seq, 1]
+
         # Action Stream Loss 
-        # act_targets = rewards + beta * r_diversity + self.args.gamma * (1 - terminated) * target_max_qvals  
-        act_targets = rewards + beta * r_diversity + self.args.gamma * (1 - terminated) * target_max_qvals           
+        act_targets = rewards + self.args.gamma * (1 - terminated) * target_max_qvals           
         td_error_act = (chosen_action_qvals - act_targets.detach())
         act_mask = mask.expand_as(td_error_act)
         td_error_act = td_error_act*act_mask
         loss_act = (td_error_act ** 2 ).sum() / act_mask.sum()
 
+        # Q_iau_exp
+        IAUtargets_exp = r_diversity + self.args.gamma * (1 - terminated) * target_max_qvals_exp
+        td_error_iau_exp = (chosen_action_qvals_exp - IAUtargets_exp.detach())
+        mask_iau_exp = mask.expand_as(td_error_iau_exp)*new_lock
+        if mask_iau_exp.sum() == 0:
+            loss_iau_exp = th.tensor(0.0)
+        else:
+            masked_td_error_iau_exp = td_error_iau_exp * mask_iau_exp
+            loss_iau_exp = (masked_td_error_iau_exp ** 2).sum() / mask_iau_exp.sum()
+
+        # Q_iau_nav
+        nav_phase_mask = 1.0 - lock_states
+        IAUtargets_nav = factor_rewards.squeeze(-1) + self.args.gamma * (1 - terminated) * target_IAU_nav_out_max_qvals
+        td_error_iau_nav = (IAU_nav_out_action_qvals.squeeze(-1) - IAUtargets_nav.detach())
+        mask_iau_nav = mask.expand_as(td_error_iau_nav)*nav_phase_mask
+        masked_td_error_iau_nav = td_error_iau_nav * mask_iau_nav
+        loss_iau_nav = (masked_td_error_iau_nav ** 2).sum() / mask_iau_nav.sum()
+
         # Q_nav
-        # latch_states_tensor 为 1 表示已进入战斗，所以 1 - latch 为 0，就会屏蔽此阶段的梯度
-        nav_phase_mask = 1.0 - latch_states_tensor
-        nav_targets = factor_rewards[:, :-1].squeeze(-1) + self.args.gamma * (1 - terminated).expand_as(target_max_q_nav) * target_max_q_nav
-        td_error_nav = (chosen_action_q_nav - nav_targets.detach()) 
-        nav_mask = mask.expand_as(td_error_nav)
-        combined_nav_mask = nav_mask * nav_phase_mask
-        td_error_nav = combined_nav_mask*td_error_nav
-        loss_nav = (td_error_nav ** 2).sum() / combined_nav_mask.sum()
-        lambda_nav = self.args.alpha
+        # nav_phase_mask = 1.0 - lock_states
+        # nav_targets = factor_rewards.squeeze(-1) + self.args.gamma * (1 - terminated).expand_as(target_max_qvals_nav) * target_max_qvals_nav
+        # td_error_nav = (chosen_action_qvals_nav - nav_targets.detach()) 
+        # # nav_mask = mask.expand_as(td_error_nav)*(1-death)
+        # nav_mask = mask.expand_as(td_error_nav)*nav_phase_mask
+        # td_error_nav = nav_mask*td_error_nav
+        # loss_nav = (td_error_nav ** 2).sum() / nav_mask.sum()
+   
         
         # 计算对比学习 loss_cl
         # 1. 生成增强样本 (Data Augmentation)
@@ -327,7 +358,8 @@ class Diff_Hilp3_Learner:
         loss_cl = th.nn.CrossEntropyLoss()(logits, labels)
 
         # total loss
-        loss = loss_act + lambda_nav * loss_nav + self.args.cl_weight * loss_cl
+        # loss = loss_act + lambda_nav * loss_nav + self.args.cl_weight * loss_cl
+        loss = loss_act + self.args.lambda_nav * loss_iau_nav + self.args.lambda_exp * loss_iau_exp + self.args.cl_weight * loss_cl
 
         # Optimise
         self.optimiser.zero_grad()
@@ -343,6 +375,10 @@ class Diff_Hilp3_Learner:
 
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
             self.logger.log_stat("loss", loss.item(), t_env)
+            self.logger.log_stat("loss_act", loss_act.item(), t_env)          # 动作 Loss
+            self.logger.log_stat("loss_iau_exp", loss_iau_exp.item(), t_env)  # 探索意图 Loss
+            self.logger.log_stat("loss_iau_nav", loss_iau_nav.item(), t_env)  # 导航意图 Loss
+            self.logger.log_stat("loss_cl", loss_cl.item(), t_env)  
             if self.args.pre_train_diff:
                 self.logger.log_stat("diff_loss", diffusion_loss, t_env)
                 self.logger.log_stat("diff_return", diff_return.item(), t_env)
@@ -354,9 +390,15 @@ class Diff_Hilp3_Learner:
             self.log_stats_t = t_env
         return diff_return.item()
     
-    def _get_IAU_input(self, size, action_values, encoded, goals):
-        IAU_inputs = th.cat((action_values,encoded, goals),dim=-1)
-        return IAU_inputs
+    def _get_IAU_nav_input(self, action_values, hidden):
+        action_values = action_values.unsqueeze(-1)
+        IAU_inputs = th.cat((action_values,hidden),dim=-1)
+        return IAU_inputs.to(self.device)
+    
+    def _get_IAU_exp_input(self, action_values, hidden):
+        action_values = action_values.unsqueeze(-1)
+        IAU_inputs = th.cat((action_values,hidden),dim=-1)
+        return IAU_inputs.to(self.device)
     
     def _get_OAU_input(self, size, action_values, encoded):
         OAU_inputs = th.cat((action_values,encoded),dim=-1)
@@ -370,29 +412,60 @@ class Diff_Hilp3_Learner:
         inputs = th.cat([x.reshape(bs, self.n_agents, -1) for x in inputs], dim=2)
         return inputs
     
+    # def _update_targets(self):
+    #     self.target_mac.load_state(self.mac)
+    #     if self.mixer is not None:
+    #         self.target_mixer.load_state_dict(self.mixer.state_dict())
+    #     self.logger.console_logger.info("Updated target network")
+
+    # def _update_targets_soft(self,tau):
+    #     # self.target_mac.load_state(self.mac)
+    #     for target_param, param in zip(self.target_mac.parameters(), self.mac.parameters()):
+    #             target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+
+    #     if self.mixer is not None:
+    #         for target_param, param in zip(self.target_mixer.parameters(), self.mixer.parameters()):
+    #             target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+    #         # self.target_mixer.load_state_dict(self.mixer.state_dict())
+    #     self.logger.console_logger.info("Updated target network")
+
     def _update_targets(self):
         self.target_mac.load_state(self.mac)
+        self.target_IAU_exp.load_state_dict(self.IAU_exp.state_dict()) 
+        self.target_IAU_nav.load_state_dict(self.IAU_nav.state_dict()) 
         if self.mixer is not None:
             self.target_mixer.load_state_dict(self.mixer.state_dict())
-        self.logger.console_logger.info("Updated target network")
+            self.target_mixer_exp.load_state_dict(self.mixer_exp.state_dict()) 
 
     def _update_targets_soft(self,tau):
-        # self.target_mac.load_state(self.mac)
         for target_param, param in zip(self.target_mac.parameters(), self.mac.parameters()):
+                target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+
+        # 新增 IAU 软更新
+        for target_param, param in zip(self.target_IAU_exp.parameters(), self.IAU_exp.parameters()):
+                target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+        for target_param, param in zip(self.target_IAU_nav.parameters(), self.IAU_nav.parameters()):
                 target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 
         if self.mixer is not None:
             for target_param, param in zip(self.target_mixer.parameters(), self.mixer.parameters()):
                 target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
-            # self.target_mixer.load_state_dict(self.mixer.state_dict())
-        self.logger.console_logger.info("Updated target network")
+            # 新增 mixer_exp 软更新
+            for target_param, param in zip(self.target_mixer_exp.parameters(), self.mixer_exp.parameters()):
+                target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 
     def cuda(self):
         self.mac.cuda()
         self.target_mac.cuda()
+        self.IAU_exp.cuda()         
+        self.IAU_nav.cuda()         
+        self.target_IAU_exp.cuda()  
+        self.target_IAU_nav.cuda()  
         if self.mixer is not None:
             self.mixer.cuda()
             self.target_mixer.cuda()
+            self.mixer_exp.cuda()      
+            self.target_mixer_exp.cuda() 
 
     def save_models(self, path):
         self.mac.save_models(path)

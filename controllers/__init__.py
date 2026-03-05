@@ -8,6 +8,7 @@ from .diff_hilp_controller import Diff_Hilp_MAC
 from .diff_hilp2_controller import Diff_Hilp2_MAC
 from .diff_exp_controller import Diff_Exp_MAC
 from .diff_hilp3_controller import Diff_Hilp3_MAC
+from .diff_hilp4_controller import Diff_Hilp4_MAC
 
 REGISTRY["basic_mac"] = BasicMAC
 REGISTRY["diff_mac"] = DiffMAC
@@ -17,3 +18,4 @@ REGISTRY["diff_hilp_mac"] = Diff_Hilp_MAC
 REGISTRY["diff_hilp2_mac"] = Diff_Hilp2_MAC
 REGISTRY["diff_exp_mac"] = Diff_Exp_MAC
 REGISTRY["diff_hilp3_mac"] = Diff_Hilp3_MAC
+REGISTRY["diff_hilp4_mac"] = Diff_Hilp4_MAC

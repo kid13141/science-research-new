@@ -93,4 +93,4 @@ class SGDAgent(nn.Module):
         q_nav = self.q_nav_head(h_out)
         q_act = self.q_act_head(h_out)
     
-        return q_nav, q_act,h_out
+        return  q_act,q_nav,h_out

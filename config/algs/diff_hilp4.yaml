@@ -6,8 +6,8 @@ epsilon_start: 1.0
 epsilon_finish: 0.05
 epsilon_anneal_time: 50000
 
-runner: "diff"
-mac: "diff_hilp2_mac"
+runner: "diff_hilp3"
+mac: "diff_hilp4_mac"
 agent: "rnn" 
 buffer_size: 5000
 
@@ -16,7 +16,7 @@ target_update_interval: 200
 
 # use the Q_Learner to train
 agent_output_type: "q"
-learner: "diff_learner"
+learner: "diff_hilp4_learner"
 double_q: True
 mixer: "qmix"
 mixing_embed_dim: 32
@@ -31,8 +31,7 @@ expectile: 0.95
 p_nextgoal: 0.5
 reward_scale: 1.0
 reward_shift: 0.0
-name: "diff"
-
+name: "diff_hilp4"
 
 diff_num: 10
 
@@ -42,13 +41,28 @@ decay_rate_thed : 0.0
 
 start_ratio: 0.2 #初始状态上限
 end_ratio: 0.9 #目标状态上限
-begin_ratio: 0.7 #目标状态下限
+begin_ratio: 0.6 #目标状态下限
 
 post_exp_ratio: 0.1 #二阶段的奖励系数
 return_scale: 1.0 #目标收益的放缩系数
-alpha: 0.5
+lambda_nav: 0.5
+lambda_exp: 0.5
 
-use_hilp: False
+use_hilp: True
 swap_goals: False
-load_diffusion: False
-n_timesteps: 20
+n_timesteps: 10
+
+team_latent_dim: 32       # 团队向量维度
+buffer_capacity: 10000    # 动态历史库大小
+knn_k: 10                 # K-近邻的 K
+diversity_beta: 0.1       # 探索奖励初始权重
+buffer_update_interval: 1 # 每多少个 Episode 更新一次 Buffer
+buffer_stride: 5          # 存入 Buffer 的采样间隔 (Stride)
+cl_weight: 0.01           # 对比学习 Loss 权重
+cl_temp: 0.1              # 对比学习 Temperature
+gating_delta: 0.3
+
+nav_weight_max: 0.6
+nav_weight_min: 0.2
+nav_test_weight: 0.1
+nav_weight_anneal_steps: 100000 

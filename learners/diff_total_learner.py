@@ -92,9 +92,9 @@ class Diff_Total_Learner:
             self.mac.embedding.optim_net.zero_grad()
             value_loss.backward()
             self.mac.embedding.optim_net.step()
-            self.logger.log_stat("v_max", value_info["v max"].item(), t_env)
-            self.logger.log_stat("v_min", value_info["v min"].item(), t_env)
-            self.logger.log_stat("v_avg", value_info["v mean"].item(), t_env)
+            self.logger.log_stat("v_max", value_info["v_max"], t_env)
+            self.logger.log_stat("v_min", value_info["v_min"], t_env)
+            self.logger.log_stat("v_mean", value_info["v_mean"], t_env)
             self.logger.log_stat("value_loss", value_loss.item(), t_env)
     
     def split_global_vector(self, global_vector, N, M, teammate_dim, enemy_dim):
@@ -128,20 +128,21 @@ class Diff_Total_Learner:
         # Get the relevant quantities
         state = batch["state"][:,:-1]
         rewards = batch["reward"][:, :-1] # (32,200,1)
-        total_rewards = batch["total_reward"][:,:-1]
+        factor_rewards = batch["factor_reward"][:,:-1].squeeze(-1)
         actions = batch["actions"][:, :-1]
         terminated = batch["terminated"][:, :-1].float()
         filled = batch["filled"][:, :-1].float()
         mask = batch["filled"][:, :-1].float()
+        death = batch["death"][:,:-1]
         mask[:, 1:] = mask[:, 1:] * (1 - terminated[:, :-1])
         avail_actions = batch["avail_actions"]
         goal_states = batch["goal"][:,:-1]
 
         # Get the threshold of first phase
-        # alpha = linear_decay(self.args.alpha, 0, 0.01, t_env)
         alpha = self.args.alpha
 
         # Diffusion Training
+        diff_return = th.tensor(0.0) # 默认值
         if self.args.pre_train_diff:
             diffusion_losses = []
             for i in range(self.args.diff_num):
@@ -159,15 +160,12 @@ class Diff_Total_Learner:
         # Calculate estimated Q-Values
         mac_out = []
         self.mac.init_hidden(state.shape[0])
-        split_goals = self.split_global_vector(goal_states[:, 0, :], self.args.n_agents, self.args.n_enemy, self.args.teammate_dim, self.args.enemy_dim)
-        split_goals_org = split_goals.clone()
-        split_goals = split_goals.unsqueeze(1).repeat(1, goal_states.shape[1], 1, 1)
-
+        
         for t in range(max_seq_length):
             agent_outs,hidden_states_outs = self.mac.forward(batch, t=t) 
-            mac_out.append(agent_outs) # (201,32,5,7)
+            mac_out.append(agent_outs)
 
-        mac_out = th.stack(mac_out, dim=1)  # Concat over time 
+        mac_out = th.stack(mac_out, dim=1)  # Concat over time
        
         # Pick the Q-Values for the actions taken by each agent
         chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)      
@@ -192,24 +190,33 @@ class Diff_Total_Learner:
             mac_out_detach[avail_actions == 0] = -9999999
             cur_max_actions = mac_out_detach[:, 1:].max(dim=3, keepdim=True)[1] #the index of max q action 
             target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3) # (32,200,5)
+            # target_max_qvals_loc = target_max_qvals.clone()
         
         else:
             target_max_qvals = target_mac_out.max(dim=3)[0]
 
         # Mix
+        # chosen_action_qvals_loc = chosen_action_qvals.clone()
         if self.mixer is not None:
             chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
             target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
 
+        # Q_loc
+        # shape_targets = factor_rewards + self.args.gamma * (1 - terminated).expand_as(target_max_qvals_loc) * target_max_qvals_loc
+        # td_error_shape = (chosen_action_qvals_loc - shape_targets.detach()) 
+        # loc_mask = mask.expand_as(td_error_shape)*(1-death)
+        # masked_td_error_shape = td_error_shape * loc_mask 
+        # loss_shape = (masked_td_error_shape ** 2).sum() / loc_mask.sum()
+
         # Q_total
-        targets = rewards + alpha * total_rewards + self.args.gamma * (1 - terminated) * target_max_qvals           
+        targets = factor_rewards.mean(-1).unsqueeze(-1) + rewards + self.args.gamma * (1 - terminated) * target_max_qvals         
         td_error = (chosen_action_qvals - targets.detach())
-        
+
         mask = mask.expand_as(td_error)
         masked_td_error = td_error * mask
         
         # total loss
-        loss = (masked_td_error ** 2).sum() / mask.sum() 
+        loss = (masked_td_error ** 2).sum() / mask.sum()
 
         # Optimise
         self.optimiser.zero_grad()
@@ -218,8 +225,8 @@ class Diff_Total_Learner:
         self.optimiser.step()
         
         # Calculate exp_reward
-        total_rewards = np.array(total_rewards.cpu())
-        prior_exp_reward = total_rewards.sum(-1).sum(-1).mean()
+        factor_rewards = np.array(factor_rewards.cpu())
+        prior_exp_reward = factor_rewards.sum(-1).sum(-1).mean()
 
         if self.args.target_update_interval > 1.0 and (episode_num - self.last_target_update_episode) / self.args.target_update_interval >= 1.0:
             self._update_targets()
@@ -229,6 +236,7 @@ class Diff_Total_Learner:
 
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
             self.logger.log_stat("loss", loss.item(), t_env)
+            # self.logger.log_stat("loss_shape", loss_shape.item(), t_env)
             if self.args.pre_train_diff:
                 self.logger.log_stat("diff_loss", diffusion_loss, t_env)
                 self.logger.log_stat("diff_return", diff_return.item(), t_env)
@@ -250,7 +258,6 @@ class Diff_Total_Learner:
         return OAU_inputs
 
     def _build_inputs(self, batch, t):
-
         bs = batch.batch_size
         inputs = []
         inputs.append(batch["obs"][:, t])  # b1av
@@ -408,12 +415,12 @@ class Diff_Total_Learner:
         masks = 1.0 - hilp_reward
         # rewards are 0 if terminal, -1 otherwise
         hilp_reward = hilp_reward - 1.0
-        #to do
+
+
         (next_v1, next_v2) = self.target_mac.embedding(hilp_next_state, hilp_goal)
         next_v = th.min(next_v1, next_v2)
         q = hilp_reward + self.args.discount * masks * next_v
 
-        #to do
         (v1_t, v2_t) = self.target_mac.embedding(hilp_state, hilp_goal)
         v_t = (v1_t + v2_t) / 2
         adv = q - v_t
@@ -428,10 +435,60 @@ class Diff_Total_Learner:
         value_loss = value_loss1 + value_loss2
 
         return value_loss, {
-            'v max': v.max(),
-            'v min': v.min(),
-            'v mean': v.mean()
+            'v_max': v.max(),
+            'v_min': v.min(),
+            'v_mean': v.mean()
             }
+
+    # def compute_value_loss(self, hilp_state, hilp_next_state, hilp_goal, hilp_reward, hilp_mask):
+    #     """
+    #     计算 HILP 网络的 Bellman Residual Loss (MSE)
+    #     对应论文公式: L = E[(r + gamma * V_target(s') - V(s))^2]
+    #     """
+    #     hilp_reward = hilp_reward.float()
+    #     hilp_mask = hilp_mask.float()
+    #     # --- 1. 奖励与掩码处理 (保持原逻辑) ---
+    #     # hilp_reward 输入时: 1.0 表示到达子目标, 0.0 表示行走中
+        
+    #     # 如果到达子目标 (reward=1), mask=0 (停止更新后续价值); 否则 mask=1
+    #     # 注意：还要结合环境本身的终止信号 (hilp_mask)
+    #     # 修正逻辑：masks = (1 - is_goal) * is_not_terminal
+    #     masks = (1.0 - hilp_reward) * hilp_mask
+        
+    #     # 构造 Dense Reward (负距离):
+    #     # Case A (到达): 1.0 - 1.0 = 0.0 (距离为0)
+    #     # Case B (行走): 0.0 - 1.0 = -1.0 (每步惩罚-1)
+    #     step_reward = hilp_reward - 1.0
+
+    #     # --- 2. 计算 TD Target (使用 Target Network) ---
+    #     with th.no_grad():
+    #         # 获取下一时刻的势能值
+    #         (next_v1, next_v2) = self.target_mac.embedding(hilp_next_state, hilp_goal)
+            
+    #         # Double Network 技巧：取最小值以缓解价值过估计
+    #         # 在度量学习中，取最小值意味着取"更远的距离估计" (更悲观/保守)，有助于鲁棒性
+    #         next_v = th.min(next_v1, next_v2)
+            
+    #         # 计算 TD 目标: y = r + gamma * mask * V(s')
+    #         target_v = step_reward + self.args.discount * masks * next_v
+
+    #     # --- 3. 计算 Current Value (使用 Online Network) ---
+    #     (v1, v2) = self.mac.embedding(hilp_state, hilp_goal)
+
+    #     # --- 4. 计算 Loss (Standard MSE) ---
+    #     # 直接让当前网络的预测值逼近 TD Target
+    #     loss1 = F.mse_loss(v1, target_v)
+    #     loss2 = F.mse_loss(v2, target_v)
+        
+    #     value_loss = loss1 + loss2
+
+    #     # --- 5. 统计信息 (用于日志) ---
+    #     return value_loss, {
+    #         'v_mean': (v1 + v2).detach().mean().item() / 2,
+    #         'v_max': (v1 + v2).detach().max().item() / 2,
+    #         'v_min': (v1 + v2).detach().min().item() / 2,
+    #         'hilp_loss': value_loss.item()
+    #     }
     
 def concatenate_dicts(dict1, dict2):
     """

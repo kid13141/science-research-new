@@ -1,5 +1,5 @@
 from modules.agents import REGISTRY as agent_REGISTRY
-from modules import Hilp_Embedding, Factoring
+from modules import Factoring,Hilp2_Embedding
 from components.action_selectors import REGISTRY as action_REGISTRY
 from diffuser.src.diffusion import GaussianDiffusion
 from diffuser.src.constructor import MLPnet
@@ -19,7 +19,8 @@ class Diff_Total_MAC:
         self.agent_output_type = args.agent_output_type
 
         self.action_selector = action_REGISTRY[args.action_selector](args)
-        self.embedding = Hilp_Embedding(args.state_shape, args)
+        self.embedding = Hilp2_Embedding(args.state_shape, args)
+        
         self.hidden_states = None
         self.loc_hidden_states = None
 

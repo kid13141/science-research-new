@@ -37,6 +37,7 @@ class BasicMAC:
                 agent_outs[reshaped_avail_actions == 0] = -1e10
 
             agent_outs = th.nn.functional.softmax(agent_outs, dim=-1)
+            
             if not test_mode:
                 # Epsilon floor
                 epsilon_action_num = agent_outs.size(-1)

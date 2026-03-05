@@ -82,7 +82,7 @@ class ParallelRunner:
         self.t = 0
         self.env_steps_this_run = 0
 
-    def run(self, test_mode=False):
+    def run(self, test_mode=False,diff_return=1.0):
         self.reset()
 
         all_terminated = False

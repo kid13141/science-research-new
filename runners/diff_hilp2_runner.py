@@ -228,6 +228,14 @@ class Diff_Hilp2_Runner:
         
         return swapped_arr
 
+    def split_distance(self, state_vector, goal_vector):
+        distances = np.linalg.norm(state_vector - goal_vector, axis=-1, keepdims=True)
+        # distances = np.sum(np.abs(state_vector - goal_vector), -1)
+        N = state_vector.shape[-1]
+        sqrt_N = math.sqrt(N)
+        distances /= sqrt_N
+        return torch.from_numpy(distances).float().to(self.args.device)
+
     def run(self, test_mode=False, diff_return=1.0, v_thed=1.0):
         self.reset()
         terminated = False

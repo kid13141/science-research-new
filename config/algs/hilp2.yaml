@@ -6,7 +6,7 @@ epsilon_start: 1.0
 epsilon_finish: 0.05
 epsilon_anneal_time: 50000
 
-runner: "diff"
+runner: "hilp2"
 mac: "diff_hilp2_mac"
 agent: "rnn" 
 buffer_size: 5000
@@ -16,7 +16,7 @@ target_update_interval: 200
 
 # use the Q_Learner to train
 agent_output_type: "q"
-learner: "diff_learner"
+learner: "hilp2_learner"
 double_q: True
 mixer: "qmix"
 mixing_embed_dim: 32
@@ -31,7 +31,7 @@ expectile: 0.95
 p_nextgoal: 0.5
 reward_scale: 1.0
 reward_shift: 0.0
-name: "diff"
+name: "hilp2"
 
 
 diff_num: 10
@@ -42,13 +42,12 @@ decay_rate_thed : 0.0
 
 start_ratio: 0.2 #初始状态上限
 end_ratio: 0.9 #目标状态上限
-begin_ratio: 0.7 #目标状态下限
+begin_ratio: 0.6 #目标状态下限
 
 post_exp_ratio: 0.1 #二阶段的奖励系数
 return_scale: 1.0 #目标收益的放缩系数
-alpha: 0.5
+alpha: 0.1
 
-use_hilp: False
+use_hilp: True
 swap_goals: False
-load_diffusion: False
-n_timesteps: 20
+n_timesteps: 10

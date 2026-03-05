@@ -65,7 +65,7 @@ def phi_distance(mac,cur_states,goal_states):
         dist = torch.sqrt(torch.clamp(squared_dist, min=1e-6))
     return dist
 
-class Diff_Total_Runner:
+class Hilp2_Runner:
 
     def __init__(self, args, logger):
         self.args = args
@@ -234,7 +234,6 @@ class Diff_Total_Runner:
         episode_return = 0
         stop = 1
         self.mac.init_hidden(batch_size=self.batch_size)
-        # thed = linear_decay(0.3, 0, 0.015, self.t_env)
         min_dis = 1000
         while not terminated:
             if self.t == 0:
@@ -242,15 +241,37 @@ class Diff_Total_Runner:
                 cur_state = torch.from_numpy(cur_state).cuda()
                 last_state = cur_state
 
-                start_state = np.array([self.env.get_state()])
-                norm_state = normalize_states(start_state, self.args.states_max, self.args.states_min)
-                norm_state_th = torch.tensor(norm_state).cuda()
-                returns = torch.ones(norm_state_th.shape[0], 1).cuda() * diff_return
-
-                with torch.no_grad():
-                    goal_states_th = self.mac.diffusion_agent.forward(cond=norm_state_th, returns=returns) # sample (s_0, s_sg) from diffusion model
-                    goal_states = non_normalized(goal_states_th[:,:self.args.state_shape].to('cpu').numpy(),self.args.states_max, self.args.states_min)
-                    goal_states = torch.tensor(goal_states).cuda().float()
+                if hasattr(self, 'buffer') and self.buffer.episodes_in_buffer > 0:
+                    # 1. 采样历史数据
+                    sample_size = min(32, self.buffer.episodes_in_buffer)
+                    sampled_batch = self.buffer.sample(sample_size)
+                    
+                    # 2. 直接对 reward 序列求和，一键找出总回报最高轨迹的索引
+                    # sampled_batch["reward"] shape: [batch, seq_len, 1]
+                    ep_returns = sampled_batch["reward"].sum(dim=1).squeeze(-1)
+                    best_idx = torch.argmax(ep_returns).item()
+                    
+                    # 3. 仅计算这条最优轨迹的有效长度
+                    terminated_mask = sampled_batch["terminated"][best_idx, :-1].squeeze(-1)
+                    if terminated_mask.sum() > 0:
+                        best_len = torch.nonzero(terminated_mask)[0][0].item() + 1
+                    else:
+                        best_len = terminated_mask.shape[0]
+                    
+                    # 4. 抽取目标状态
+                    if best_len > 2:
+                        start_idx = int(best_len * getattr(self.args, "begin_ratio", 0.6))
+                        # 使用 max 确保 end_idx 至少比 start_idx 大 1
+                        end_idx = max(start_idx + 1, int(best_len * getattr(self.args, "end_ratio", 0.9)))
+                        
+                        goal_t = np.random.randint(start_idx, end_idx)
+                        goal_states = sampled_batch["state"][best_idx, goal_t].unsqueeze(0).cuda().float()
+                    else:
+                        goal_states = cur_state.clone()
+                else:
+                    # 第一回合 Buffer 为空
+                    goal_states = cur_state.clone()
+                # ========================================================
 
                 last_dis = phi_distance(self.mac, cur_state, goal_states)
                 init_dis = last_dis
