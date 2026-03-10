@@ -9,6 +9,8 @@ from .diff_hilp3_learner import Diff_Hilp3_Learner
 from .diff_hilp4_learner import Diff_Hilp4_Learner
 from .hilp2_learner import Hilp2_Learner
 from .ppo_learner import PPOLearner
+from .diff_hilp4_iau_learner import Diff_Hilp4_IAU_Learner
+from .diff_hilp4_exp_learner import Diff_Hilp4_Exp_Learner
 REGISTRY = {}
 
 REGISTRY["q_learner"] = QLearner
@@ -22,3 +24,5 @@ REGISTRY["diff_hilp3_learner"] = Diff_Hilp3_Learner
 REGISTRY["diff_hilp4_learner"] = Diff_Hilp4_Learner
 REGISTRY["hilp2_learner"] = Hilp2_Learner
 REGISTRY["ppo_learner"] = PPOLearner
+REGISTRY["diff_hilp4_iau_learner"] = Diff_Hilp4_IAU_Learner
+REGISTRY["diff_hilp4_exp_learner"] = Diff_Hilp4_Exp_Learner

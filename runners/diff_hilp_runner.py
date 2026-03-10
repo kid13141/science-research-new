@@ -335,11 +335,12 @@ class Diff_Hilp_Runner:
             states, goals, dis, exp_reward = self.test_phi(self.batch["state"], self.batch["terminated"], self.batch["goal"], self.batch["actions"], self.batch["factor_reward"])
             return states, goals, dis, exp_reward
         
-        if self.t_env - self.log_goal_period >= 1000:
-            self.goals.append(self.batch["goal"][0][0].detach().cpu().numpy())
-            self.log_goal_period = self.t_env
+        # if self.t_env - self.log_goal_period >= 1000:
+        #     self.goals.append(self.batch["goal"][0][0].detach().cpu().numpy())
+        #     self.log_goal_period = self.t_env
 
-        if self.t_env - self.log_goal_t >= 50000:
+        if self.t_env <= 200000 and self.t_env - self.log_goal_t >= 10000:
+            self.goals.append(self.batch["goal"][:,0,:].detach().cpu().numpy())
             self.log_goal()
             self.goals = []
             self.log_goal_t = self.t_env

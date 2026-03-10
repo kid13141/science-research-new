@@ -79,6 +79,7 @@ class Diff_Hilp2_Runner:
         self.t = 0
         self.log_goal_time = 0
         self.goals = []
+        self.start_states = []
         self.t_env = 0
 
         self.train_returns = []
@@ -97,19 +98,21 @@ class Diff_Hilp2_Runner:
         self.lower_bound_thed = args.lower_bound_thed
         self.decay_rate_thed = args.decay_rate_thed
         self.get_state_limit()
-            # 要操作的文件夹路径
+
+        # 要操作的文件夹路径
         folder_path = "/home/songshoucheng/GUF_2025/log_goals"
+
+        # 判断文件夹是否为空，不为空则清空文件夹
+        if self.args.vis_state == False:
+            if not is_dir_empty(folder_path):
+                clear_non_empty_directory(folder_path)
+                print(f"文件夹 {folder_path} 已清空。")
+            else:
+                print(f"文件夹 {folder_path} 为空。")
 
         self.running_fr_max = 1e-4
         self.running_max_dist = 0.1 # 初始化为一个合理的小值
-
-        # 判断文件夹是否为空，不为空则清空文件夹
-        if not is_dir_empty(folder_path):
-            clear_non_empty_directory(folder_path)
-            print(f"文件夹 {folder_path} 已清空。")
-        else:
-            print(f"文件夹 {folder_path} 为空。")
-
+        
 
     def setup(self, scheme, groups, preprocess, mac):
         self.new_batch = partial(EpisodeBatch, scheme, groups, self.batch_size, self.episode_limit + 1,
@@ -364,13 +367,12 @@ class Diff_Hilp2_Runner:
             states, goals, dis, exp_reward = self.test_phi(self.batch["state"], self.batch["terminated"], self.batch["goal"], self.batch["actions"], self.batch["factor_reward"])
             return states, goals, dis, exp_reward
         
-        if self.t_env - self.log_goal_period >= 1000:
-            self.goals.append(self.batch["goal"][0][0].detach().cpu().numpy())
-            self.log_goal_period = self.t_env
-
-        if self.t_env - self.log_goal_t >= 50000:
+        if self.args.vis_state == False and self.t_env <= 200000 and self.t_env - self.log_goal_t >= 10000:
+            self.goals.append(self.batch["goal"][:,0,:].detach().cpu().numpy())
+            self.start_states.append(self.batch["state"][:,0,:].detach().cpu().numpy())
             self.log_goal()
             self.goals = []
+            self.start_states = []
             self.log_goal_t = self.t_env
 
         return self.batch
@@ -415,6 +417,11 @@ class Diff_Hilp2_Runner:
     
     def log_goal(self):
         goals = np.array(self.goals)
-        log_name = "/home/songshoucheng/GUF_2025/log_goals/goals_"+ str(int(self.t_env / 50000)) + ".pkl"
+        start_states = np.array(self.start_states)
+        log_name = "/home/songshoucheng/GUF_2025/log_goals/goals_"+ str(int(self.t_env / 10000)) + ".pkl"
         with open(log_name, 'wb') as f:
             pickle.dump(goals, f)
+
+        state_log_name = "/home/songshoucheng/GUF_2025/log_goals/starts_"+ str(int(self.t_env / 10000)) + ".pkl"
+        with open(state_log_name, 'wb') as f:
+            pickle.dump(start_states, f)

@@ -16,7 +16,7 @@ target_update_interval: 200
 
 # use the Q_Learner to train
 agent_output_type: "q"
-learner: "diff_hilp4_learner"
+learner: "diff_hilp4_exp_learner"
 double_q: True
 mixer: "qmix"
 mixing_embed_dim: 32
@@ -31,7 +31,7 @@ expectile: 0.95
 p_nextgoal: 0.5
 reward_scale: 1.0
 reward_shift: 0.0
-name: "diff_hilp4"
+name: "diff_hilp4_exp"
 
 diff_num: 10
 

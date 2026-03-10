@@ -56,7 +56,7 @@ def compute_infonce_loss(c_t, d):
     return info_nce_loss
 
 
-class Diff_Hilp4_Learner:
+class Diff_Hilp4_IAU_Learner:
     def __init__(self, mac, scheme, logger, args):
         self.args = args
         self.mac = mac
@@ -68,10 +68,10 @@ class Diff_Hilp4_Learner:
         self.mixer = None
         self.device = th.device('cuda' if args.use_cuda else 'cpu')
 
-        self.IAU_exp = IAU(input_dim=65, n_action=args.n_actions)
+        # self.IAU_exp = IAU(input_dim=65, n_action=args.n_actions)
         self.IAU_nav = IAU(input_dim=65, n_action=args.n_actions)
 
-        self.params += list(self.IAU_exp.parameters())
+        # self.params += list(self.IAU_exp.parameters())
         self.params += list(self.IAU_nav.parameters())
 
         if args.mixer is not None:
@@ -83,28 +83,28 @@ class Diff_Hilp4_Learner:
             else:
                 raise ValueError("Mixer {} not recognised.".format(args.mixer))
             self.params += list(self.mixer.parameters())
-            self.params += list(self.mixer_exp.parameters())
+            # self.params += list(self.mixer_exp.parameters())
             self.target_mixer = copy.deepcopy(self.mixer)
-            self.target_mixer_exp = copy.deepcopy(self.mixer_exp)
+            # self.target_mixer_exp = copy.deepcopy(self.mixer_exp)
         
 
         # ---初始化team多样性模块 ---
-        self.team_encoder = TeamEncoder(args).to(self.device)
-        self.params += list(self.team_encoder.parameters())
+        # self.team_encoder = TeamEncoder(args).to(self.device)
+        # self.params += list(self.team_encoder.parameters())
         
-        self.history_buffer = HistoryBuffer(
-            capacity=args.buffer_capacity, 
-            k=args.knn_k, 
-            latent_dim=args.team_latent_dim,
-            device=self.device
-        )
+        # self.history_buffer = HistoryBuffer(
+        #     capacity=args.buffer_capacity, 
+        #     k=args.knn_k, 
+        #     latent_dim=args.team_latent_dim,
+        #     device=self.device
+        # )
 
         self.optimiser = RMSprop(params=self.params, lr=args.lr, alpha=args.optim_alpha, eps=args.optim_eps)
         self.diff_optimiser = Adam(params=self.diff_params, lr=args.lr, weight_decay=getattr(args, "weight_decay", 0))
 
         # a little wasteful to deepcopy (e.g. duplicates action selector), but should work for any MAC
         self.target_mac = copy.deepcopy(mac)
-        self.target_IAU_exp = copy.deepcopy(self.IAU_exp)
+        # self.target_IAU_exp = copy.deepcopy(self.IAU_exp)
         self.target_IAU_nav = copy.deepcopy(self.IAU_nav)
         self.log_stats_t = -self.args.learner_log_interval - 1
         self.last_diff_return = 1
@@ -188,11 +188,6 @@ class Diff_Hilp4_Learner:
         self.mac.init_hidden(state.shape[0])
 
         for t in range(max_seq_length):
-            # agent_outs,agent_out_nav,h1,h2 = self.mac.forward(batch, t=t) 
-            # mac_out.append(agent_outs)
-            # mac_out_nav.append(agent_out_nav)
-            # hidden_states_list.append(h1.view(batch.batch_size, self.args.n_agents, -1))
-
             agent_outs,hidden_states_outs = self.mac.forward(batch, t=t) 
             hidden_states_outs = hidden_states_outs.view(batch["state"].shape[0], self.n_agents, -1)
             mac_out.append(agent_outs)
@@ -205,26 +200,26 @@ class Diff_Hilp4_Learner:
 
         IAU_nav_inputs = self._get_IAU_nav_input(chosen_action_qvals,hidden_states)
         IAU_nav_out = self.IAU_nav(IAU_nav_inputs) 
-        IAU_exp_inputs = self._get_IAU_exp_input(chosen_action_qvals,hidden_states)
-        IAU_exp_out = self.IAU_exp(IAU_exp_inputs) 
+        # IAU_exp_inputs = self._get_IAU_exp_input(chosen_action_qvals,hidden_states)
+        # IAU_exp_out = self.IAU_exp(IAU_exp_inputs) 
 
         IAU_nav_out_action_qvals = th.gather(IAU_nav_out, dim=3, index=actions)
-        IAU_exp_out_action_qvals = th.gather(IAU_exp_out, dim=3, index=actions)
+        # IAU_exp_out_action_qvals = th.gather(IAU_exp_out, dim=3, index=actions)
         # chosen_action_qvals_nav = th.gather(mac_out_nav[:, :-1], dim=3, index=actions).squeeze(3) 
 
         # exp_reward
-        z_team = self.team_encoder(hidden_states) # [Batch, Seq-1, Latent]
-        with th.no_grad():
-            r_diversity = self.history_buffer.compute_entropy_reward(z_team)
-            # 间隔更新 History Buffer
-            if episode_num % self.args.buffer_update_interval == 0:
-                # 展平并存入
-                flat_z = z_team.reshape(-1, self.args.team_latent_dim)
-                # 随机采样一部分存入，而不是全部 
-                stride = self.args.buffer_stride
-                self.history_buffer.add(flat_z[::stride].detach())
+        # z_team = self.team_encoder(hidden_states) # [Batch, Seq-1, Latent]
+        # with th.no_grad():
+        #     r_diversity = self.history_buffer.compute_entropy_reward(z_team)
+        #     # 间隔更新 History Buffer
+        #     if episode_num % self.args.buffer_update_interval == 0:
+        #         # 展平并存入
+        #         flat_z = z_team.reshape(-1, self.args.team_latent_dim)
+        #         # 随机采样一部分存入，而不是全部 
+        #         stride = self.args.buffer_stride
+        #         self.history_buffer.add(flat_z[::stride].detach())
 
-        beta = max(0, self.args.diversity_beta * (1 - t_env / self.args.t_max))
+        # beta = max(0, self.args.diversity_beta * (1 - t_env / self.args.t_max))
     
 
         # Calculate the Q-Values necessary for the target
@@ -256,20 +251,18 @@ class Diff_Hilp4_Learner:
 
 
             # 使用当前网络的 q_exp 选择动作，作用于 target_q_exp
-            target_IAU_exp_inputs = self._get_IAU_exp_input(target_max_qvals, hidden_states)
-            target_IAU_exp_out = self.target_IAU_exp(target_IAU_exp_inputs)
-            target_IAU_exp_out[avail_actions[:, 1:] == 0] = -9999999
-
-            cur_max_actions_exp = IAU_exp_out.clone().detach()
-            cur_max_actions_exp[avail_actions[:, 1:] == 0] = -9999999
-            max_actions_ids_exp = cur_max_actions_exp.max(dim=3, keepdim=True)[1]
-            target_IAU_exp_out_max_qvals = th.gather(target_IAU_exp_out, 3, max_actions_ids_exp).squeeze(3)
+            # target_IAU_exp_inputs = self._get_IAU_exp_input(target_max_qvals, hidden_states)
+            # target_IAU_exp_out = self.target_IAU_exp(target_IAU_exp_inputs)
+            # target_IAU_exp_out[avail_actions[:, 1:] == 0] = -9999999
+            # cur_max_actions_exp = IAU_exp_out.clone().detach()
+            # cur_max_actions_exp[avail_actions[:, 1:] == 0] = -9999999
+            # max_actions_ids_exp = cur_max_actions_exp.max(dim=3, keepdim=True)[1]
+            # target_IAU_exp_out_max_qvals = th.gather(target_IAU_exp_out, 3, max_actions_ids_exp).squeeze(3)
 
             # 使用当前网络的 q_nav 选择动作，作用于 target_q_nav
             target_IAU_nav_inputs = self._get_IAU_nav_input(target_max_qvals, hidden_states)
             target_IAU_nav_out = self.target_IAU_nav(target_IAU_nav_inputs)
             target_IAU_nav_out[avail_actions[:, 1:] == 0] = -9999999
-
             cur_max_actions_nav = IAU_nav_out.clone().detach()
             cur_max_actions_nav[avail_actions[:,1:] == 0] = -9999999
             max_actions_ids_nav = cur_max_actions_nav.max(dim=3, keepdim=True)[1]
@@ -277,9 +270,9 @@ class Diff_Hilp4_Learner:
 
         else:
             target_max_qvals = target_mac_out.max(dim=3)[0]
-            target_IAU_exp_inputs = self._get_IAU_exp_input(target_max_qvals, hidden_states)
-            target_IAU_exp_out = self.target_IAU_exp(target_IAU_exp_inputs)
-            target_IAU_exp_out_max_qvals = target_IAU_exp_out.max(dim=3)[0]
+            # target_IAU_exp_inputs = self._get_IAU_exp_input(target_max_qvals, hidden_states)
+            # target_IAU_exp_out = self.target_IAU_exp(target_IAU_exp_inputs)
+            # target_IAU_exp_out_max_qvals = target_IAU_exp_out.max(dim=3)[0]
             target_IAU_nav_inputs = self._get_IAU_nav_input(target_max_qvals, hidden_states)
             target_IAU_nav_out = self.target_IAU_nav(target_IAU_nav_inputs)
             target_IAU_nav_out_max_qvals = target_IAU_nav_out.max(dim=3)[0]
@@ -290,11 +283,11 @@ class Diff_Hilp4_Learner:
             chosen_action_qvals = self.mixer(chosen_action_qvals, batch["state"][:, :-1])
             target_max_qvals = self.target_mixer(target_max_qvals, batch["state"][:, 1:])
 
-            chosen_action_qvals_exp = self.mixer_exp(IAU_exp_out_action_qvals, batch["state"][:, :-1])
-            target_max_qvals_exp = self.target_mixer_exp(target_IAU_exp_out_max_qvals, batch["state"][:, 1:])
+            # chosen_action_qvals_exp = self.mixer_exp(IAU_exp_out_action_qvals, batch["state"][:, :-1])
+            # target_max_qvals_exp = self.target_mixer_exp(target_IAU_exp_out_max_qvals, batch["state"][:, 1:])
 
-        threshold = self.n_agents*3/4
-        new_lock = (lock_states.sum(dim=-1, keepdim=True) >= threshold).float()  # [bs, seq, 1]
+        # threshold = self.n_agents*3/4
+        # new_lock = (lock_states.sum(dim=-1, keepdim=True) >= threshold).float()  # [bs, seq, 1]
 
         # Action Stream Loss 
         act_targets = rewards + self.args.gamma * (1 - terminated) * target_max_qvals           
@@ -304,14 +297,14 @@ class Diff_Hilp4_Learner:
         loss_act = (td_error_act ** 2 ).sum() / act_mask.sum()
 
         # Q_iau_exp
-        IAUtargets_exp = beta*r_diversity + self.args.gamma * (1 - terminated) * target_max_qvals_exp
-        td_error_iau_exp = (chosen_action_qvals_exp - IAUtargets_exp.detach())
-        mask_iau_exp = mask.expand_as(td_error_iau_exp)*new_lock
-        if mask_iau_exp.sum() == 0:
-            loss_iau_exp = th.tensor(0.0)
-        else:
-            masked_td_error_iau_exp = td_error_iau_exp * mask_iau_exp
-            loss_iau_exp = (masked_td_error_iau_exp ** 2).sum() / mask_iau_exp.sum()
+        # IAUtargets_exp = beta*r_diversity + self.args.gamma * (1 - terminated) * target_max_qvals_exp
+        # td_error_iau_exp = (chosen_action_qvals_exp - IAUtargets_exp.detach())
+        # mask_iau_exp = mask.expand_as(td_error_iau_exp)*new_lock
+        # if mask_iau_exp.sum() == 0:
+        #     loss_iau_exp = th.tensor(0.0)
+        # else:
+        #     masked_td_error_iau_exp = td_error_iau_exp * mask_iau_exp
+        #     loss_iau_exp = (masked_td_error_iau_exp ** 2).sum() / mask_iau_exp.sum()
 
         # Q_iau_nav
         nav_phase_mask = 1.0 - lock_states
@@ -320,57 +313,47 @@ class Diff_Hilp4_Learner:
         mask_iau_nav = mask.expand_as(td_error_iau_nav)*nav_phase_mask
         masked_td_error_iau_nav = td_error_iau_nav * mask_iau_nav
         loss_iau_nav = (masked_td_error_iau_nav ** 2).sum() / mask_iau_nav.sum()
-
-        # Q_nav
-        # nav_phase_mask = 1.0 - lock_states
-        # nav_targets = factor_rewards.squeeze(-1) + self.args.gamma * (1 - terminated).expand_as(target_max_qvals_nav) * target_max_qvals_nav
-        # td_error_nav = (chosen_action_qvals_nav - nav_targets.detach()) 
-        # # nav_mask = mask.expand_as(td_error_nav)*(1-death)
-        # nav_mask = mask.expand_as(td_error_nav)*nav_phase_mask
-        # td_error_nav = nav_mask*td_error_nav
-        # loss_nav = (td_error_nav ** 2).sum() / nav_mask.sum()
-   
         
         # 计算对比学习 loss_cl
         # 1. 生成增强样本 (Data Augmentation)
         # 给 hidden_states 加噪声，制造同一轨迹的"另一个视图"
-        noise = th.randn_like(hidden_states) * 0.1
-        z_team_aug = self.team_encoder(hidden_states + noise)
+        # noise = th.randn_like(hidden_states) * 0.1
+        # z_team_aug = self.team_encoder(hidden_states + noise)
         
-        # 2. 轨迹聚合 (Trajectory Pooling) - 关键步骤
-        # 我们需要处理 Padding，只对有效时间步求平均
-        # mask shape: [Batch, Seq, 1] -> 确保 mask 维度正确
-        mask_expanded = mask.expand_as(z_team) # [Batch, Seq, Latent]
+        # # 2. 轨迹聚合 (Trajectory Pooling) - 关键步骤
+        # # 我们需要处理 Padding，只对有效时间步求平均
+        # # mask shape: [Batch, Seq, 1] -> 确保 mask 维度正确
+        # mask_expanded = mask.expand_as(z_team) # [Batch, Seq, Latent]
         
-        # 计算有效时间步的 sum
-        sum_z_team = (z_team * mask_expanded).sum(dim=1)         # [Batch, Latent]
-        sum_z_team_aug = (z_team_aug * mask_expanded).sum(dim=1) # [Batch, Latent]
+        # # 计算有效时间步的 sum
+        # sum_z_team = (z_team * mask_expanded).sum(dim=1)         # [Batch, Latent]
+        # sum_z_team_aug = (z_team_aug * mask_expanded).sum(dim=1) # [Batch, Latent]
         
-        # 计算每个 Batch 的有效长度 (防止除以 0，加一个极小值)
-        seq_lengths = mask.sum(dim=1).expand(-1, self.args.team_latent_dim) # [Batch, Latent]
-        seq_lengths = th.clamp(seq_lengths, min=1.0)
+        # # 计算每个 Batch 的有效长度 (防止除以 0，加一个极小值)
+        # seq_lengths = mask.sum(dim=1).expand(-1, self.args.team_latent_dim) # [Batch, Latent]
+        # seq_lengths = th.clamp(seq_lengths, min=1.0)
         
-        # 得到轨迹级的 Embedding [Batch, Latent]
-        traj_repr = sum_z_team / seq_lengths
-        traj_repr_aug = sum_z_team_aug / seq_lengths
+        # # 得到轨迹级的 Embedding [Batch, Latent]
+        # traj_repr = sum_z_team / seq_lengths
+        # traj_repr_aug = sum_z_team_aug / seq_lengths
         
-        # 3. 归一化 (L2 Normalize) - 推荐操作
-        # 对比学习中，特征归一化通常能稳定训练
-        traj_repr = F.normalize(traj_repr, dim=1)
-        traj_repr_aug = F.normalize(traj_repr_aug, dim=1)
+        # # 3. 归一化 (L2 Normalize) - 推荐操作
+        # # 对比学习中，特征归一化通常能稳定训练
+        # traj_repr = F.normalize(traj_repr, dim=1)
+        # traj_repr_aug = F.normalize(traj_repr_aug, dim=1)
 
-        # 4. 计算 InfoNCE Loss (Batch Contrast)
-        # Logits shape: [Batch, Batch]
-        # (i, j) 元素代表：第 i 条轨迹 与 第 j 条增强轨迹 的相似度
-        logits = th.matmul(traj_repr, traj_repr_aug.T) / self.args.cl_temp
+        # # 4. 计算 InfoNCE Loss (Batch Contrast)
+        # # Logits shape: [Batch, Batch]
+        # # (i, j) 元素代表：第 i 条轨迹 与 第 j 条增强轨迹 的相似度
+        # logits = th.matmul(traj_repr, traj_repr_aug.T) / self.args.cl_temp
         
-        # 标签：对角线是正样本 (0,0), (1,1)...
-        labels = th.arange(logits.shape[0]).to(self.device)
-        loss_cl = th.nn.CrossEntropyLoss()(logits, labels)
+        # # 标签：对角线是正样本 (0,0), (1,1)...
+        # labels = th.arange(logits.shape[0]).to(self.device)
+        # loss_cl = th.nn.CrossEntropyLoss()(logits, labels)
 
         # total loss
         # loss = loss_act + lambda_nav * loss_nav + self.args.cl_weight * loss_cl
-        loss = loss_act + self.args.lambda_nav * loss_iau_nav + self.args.lambda_exp * loss_iau_exp + self.args.cl_weight * loss_cl
+        loss = loss_act + self.args.lambda_nav * loss_iau_nav
 
         # Optimise
         self.optimiser.zero_grad()
@@ -387,9 +370,9 @@ class Diff_Hilp4_Learner:
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
             self.logger.log_stat("loss", loss.item(), t_env)
             self.logger.log_stat("loss_act", loss_act.item(), t_env)          # 动作 Loss
-            self.logger.log_stat("loss_iau_exp", loss_iau_exp.item(), t_env)  # 探索意图 Loss
+            # self.logger.log_stat("loss_iau_exp", loss_iau_exp.item(), t_env)  # 探索意图 Loss
             self.logger.log_stat("loss_iau_nav", loss_iau_nav.item(), t_env)  # 导航意图 Loss
-            self.logger.log_stat("loss_cl", loss_cl.item(), t_env)  
+            # self.logger.log_stat("loss_cl", loss_cl.item(), t_env)  
             if self.args.pre_train_diff:
                 self.logger.log_stat("diff_loss", diffusion_loss, t_env)
                 self.logger.log_stat("diff_return", diff_return.item(), t_env)
@@ -442,19 +425,19 @@ class Diff_Hilp4_Learner:
 
     def _update_targets(self):
         self.target_mac.load_state(self.mac)
-        self.target_IAU_exp.load_state_dict(self.IAU_exp.state_dict()) 
+        # self.target_IAU_exp.load_state_dict(self.IAU_exp.state_dict()) 
         self.target_IAU_nav.load_state_dict(self.IAU_nav.state_dict()) 
         if self.mixer is not None:
             self.target_mixer.load_state_dict(self.mixer.state_dict())
-            self.target_mixer_exp.load_state_dict(self.mixer_exp.state_dict()) 
+            # self.target_mixer_exp.load_state_dict(self.mixer_exp.state_dict()) 
 
     def _update_targets_soft(self,tau):
         for target_param, param in zip(self.target_mac.parameters(), self.mac.parameters()):
                 target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 
         # 新增 IAU 软更新
-        for target_param, param in zip(self.target_IAU_exp.parameters(), self.IAU_exp.parameters()):
-                target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+        # for target_param, param in zip(self.target_IAU_exp.parameters(), self.IAU_exp.parameters()):
+        #         target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
         for target_param, param in zip(self.target_IAU_nav.parameters(), self.IAU_nav.parameters()):
                 target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 
@@ -462,21 +445,21 @@ class Diff_Hilp4_Learner:
             for target_param, param in zip(self.target_mixer.parameters(), self.mixer.parameters()):
                 target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
             # 新增 mixer_exp 软更新
-            for target_param, param in zip(self.target_mixer_exp.parameters(), self.mixer_exp.parameters()):
-                target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
+            # for target_param, param in zip(self.target_mixer_exp.parameters(), self.mixer_exp.parameters()):
+            #     target_param.data.copy_(target_param.data * (1.0 - tau) + param.data * tau)
 
     def cuda(self):
         self.mac.cuda()
         self.target_mac.cuda()
-        self.IAU_exp.cuda()         
+        # self.IAU_exp.cuda()         
         self.IAU_nav.cuda()         
-        self.target_IAU_exp.cuda()  
+        # self.target_IAU_exp.cuda()  
         self.target_IAU_nav.cuda()  
         if self.mixer is not None:
             self.mixer.cuda()
             self.target_mixer.cuda()
-            self.mixer_exp.cuda()      
-            self.target_mixer_exp.cuda() 
+            # self.mixer_exp.cuda()      
+            # self.target_mixer_exp.cuda() 
 
     def save_models(self, path):
         self.mac.save_models(path)
