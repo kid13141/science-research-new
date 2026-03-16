@@ -10,7 +10,7 @@ SAVE_PNG_DIR = '/home/songshoucheng/GUF_2025/png_state'
 DPI = 300
 FIG_SIZE_SINGLE = (8, 8)
 
-N_AGENTS = 5 # 已更新为你需要的数量
+N_AGENTS = 5   # 已更新为你需要的数量
 N_ENEMYS = 1   # 假设有3个敌人，如果只有1个请改为 1
 AGENT_FEATURE_DIM = 7
 ENEMY_FEATURE_DIM = 5
@@ -31,6 +31,7 @@ os.makedirs(SAVE_PNG_DIR, exist_ok=True)
 enemy_start_idx = N_AGENTS * AGENT_FEATURE_DIM
 
 # 只获取 goals 的 pkl 文件，以此为基准去寻找对应的 starts 文件
+# 适配新版命名: goals_stage_50k.pkl
 goal_files = glob.glob(os.path.join(LOG_DIR, 'goals_*.pkl'))
 goal_files.sort()
 
@@ -42,7 +43,7 @@ print(f"共找到 {len(goal_files)} 对 PKL 文件，开始批量生成可视化
 
 # ========== 遍历每个 goals_*.pkl 文件 ==========
 for goal_path in goal_files:
-    # 解析出当前的 idx，例如从 'goals_1.pkl' 中提取 '1'
+    # 解析出当前的 idx，例如从 'goals_stage_50k.pkl' 中提取 'stage_50k'
     base_name = os.path.basename(goal_path)
     idx_str = base_name.replace('goals_', '').replace('.pkl', '')
     
@@ -59,31 +60,25 @@ for goal_path in goal_files:
         print(f"读取阶段 {idx_str} 的数据失败，请检查配套的 starts pkl 文件是否存在。错误：{e}")
         continue
 
-    # 兼容不同的数据形状
+    # 当前数据的 shape 应该是 (5, dim)，n_episodes 理论上等于 5
     if hasattr(goals, 'shape'):
         n_episodes = goals.shape[0]
     else:
         n_episodes = len(goals)
 
     file_name = f"phase_{idx_str}"
-    print(f"\n正在处理 [{file_name}] - 包含 {n_episodes} 个 episodes...")
+    print(f"\n正在处理 [{file_name}] - 包含 {n_episodes} 条轨迹(Episodes)...")
 
     # 为当前训练阶段创建一个子文件夹
     current_save_dir = os.path.join(SAVE_PNG_DIR, file_name)
     os.makedirs(current_save_dir, exist_ok=True)
 
-    # 遍历当前 pkl 中的每一条数据
+    # 遍历当前阶段中的每一条轨迹
     for ep_idx in range(n_episodes):
-        try:
-            if len(np.array(goals[ep_idx]).shape) > 1:
-                goal_state = np.array(goals[ep_idx][0]).flatten()
-                start_state = np.array(starts[ep_idx][0]).flatten()
-            else:
-                goal_state = np.array(goals[ep_idx]).flatten()
-                start_state = np.array(starts[ep_idx]).flatten()
-        except IndexError:
-            goal_state = np.array(goals[ep_idx]).flatten()
-            start_state = np.array(starts[ep_idx]).flatten()
+        # ========== 数据提取简化 ==========
+        # 既然我们已经将数据保存为干净的二维数组，直接取单条压平即可
+        goal_state = np.array(goals[ep_idx]).flatten()
+        start_state = np.array(starts[ep_idx]).flatten()
 
         # ========== 坐标提取核心逻辑 (重塑为矩阵，永不越界) ==========
         # 1. 提取 Agent (Start & Goal)
@@ -110,7 +105,8 @@ for goal_path in goal_files:
         fig, ax = plt.subplots(figsize=FIG_SIZE_SINGLE)
         ax.set_xlim(0, 32)      
         ax.set_ylim(0, 32)     
-        ax.set_title(f'Start vs Goal Positions - {file_name} (Episode {ep_idx})', fontsize=14)
+        # 修改标题：显示当前的训练阶段 (例如 stage_50k) 和 轨迹编号
+        ax.set_title(f'Training Phase: {idx_str} | Trajectory {ep_idx + 1}', fontsize=14)
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         ax.grid(True, alpha=0.3)
@@ -163,23 +159,20 @@ for goal_path in goal_files:
         ax.legend(loc='upper right', fontsize=10)
 
         # 保存
-        png_name = f'ep_{ep_idx:04d}.png'
+        png_name = f'trajectory_{ep_idx + 1:02d}.png'
         png_path = os.path.join(current_save_dir, png_name)
         plt.savefig(png_path, dpi=DPI, bbox_inches='tight')
         plt.close(fig)
 
-    print(f"✅ {file_name} 的图片已保存至: {current_save_dir}")
+    print(f"✅ {file_name} 的 {n_episodes} 张轨迹图片已保存至: {current_save_dir}")
 
 # ================= 预览最后加载的文件中的最后一张图 =================
-if n_episodes > 0:
+if 'n_episodes' in locals() and n_episodes > 0:
     last_ep = n_episodes - 1
     
-    if len(np.array(goals[last_ep]).shape) > 1:
-        goal_state = np.array(goals[last_ep][0]).flatten()
-        start_state = np.array(starts[last_ep][0]).flatten()
-    else:
-        goal_state = np.array(goals[last_ep]).flatten()
-        start_state = np.array(starts[last_ep]).flatten()
+    # 直接提取
+    goal_state = np.array(goals[last_ep]).flatten()
+    start_state = np.array(starts[last_ep]).flatten()
 
     # 彻底使用 reshape 修复预览越界 bug
     agent_goal_2d = goal_state[:enemy_start_idx].reshape(N_AGENTS, AGENT_FEATURE_DIM)
@@ -200,7 +193,7 @@ if n_episodes > 0:
     start_enemy_y = enemy_start_2d[:, 2] * 28 + 16
 
     fig, ax = plt.subplots(figsize=FIG_SIZE_SINGLE)
-    ax.set_title(f'Preview: {file_name} - Episode {last_ep} (Start -> Goal)', fontsize=14)
+    ax.set_title(f'Preview: Phase {idx_str} - Trajectory {last_ep + 1} (Start -> Goal)', fontsize=14)
     
     # 绘制带具体颜色的起始点、目标点和箭头
     for agent_idx in range(N_AGENTS):

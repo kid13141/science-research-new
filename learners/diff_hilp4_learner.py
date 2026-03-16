@@ -334,39 +334,75 @@ class Diff_Hilp4_Learner:
         # 计算对比学习 loss_cl
         # 1. 生成增强样本 (Data Augmentation)
         # 给 hidden_states 加噪声，制造同一轨迹的"另一个视图"
+        # noise = th.randn_like(hidden_states) * 0.1
+        # z_team_aug = self.team_encoder(hidden_states + noise)
+        
+        # # 2. 轨迹聚合 (Trajectory Pooling) - 关键步骤
+        # # 我们需要处理 Padding，只对有效时间步求平均
+        # # mask shape: [Batch, Seq, 1] -> 确保 mask 维度正确
+        # mask_expanded = mask.expand_as(z_team) # [Batch, Seq, Latent]
+        
+        # # 计算有效时间步的 sum
+        # sum_z_team = (z_team * mask_expanded).sum(dim=1)         # [Batch, Latent]
+        # sum_z_team_aug = (z_team_aug * mask_expanded).sum(dim=1) # [Batch, Latent]
+        
+        # # 计算每个 Batch 的有效长度 (防止除以 0，加一个极小值)
+        # seq_lengths = mask.sum(dim=1).expand(-1, self.args.team_latent_dim) # [Batch, Latent]
+        # seq_lengths = th.clamp(seq_lengths, min=1.0)
+        
+        # # 得到轨迹级的 Embedding [Batch, Latent]
+        # traj_repr = sum_z_team / seq_lengths
+        # traj_repr_aug = sum_z_team_aug / seq_lengths
+        
+        # # 3. 归一化 (L2 Normalize) - 推荐操作
+        # # 对比学习中，特征归一化通常能稳定训练
+        # traj_repr = F.normalize(traj_repr, dim=1)
+        # traj_repr_aug = F.normalize(traj_repr_aug, dim=1)
+
+        # # 4. 计算 InfoNCE Loss (Batch Contrast)
+        # # Logits shape: [Batch, Batch]
+        # # (i, j) 元素代表：第 i 条轨迹 与 第 j 条增强轨迹 的相似度
+        # logits = th.matmul(traj_repr, traj_repr_aug.T) / self.args.cl_temp
+        
+        # # 标签：对角线是正样本 (0,0), (1,1)...
+        # labels = th.arange(logits.shape[0]).to(self.device)
+        # loss_cl = th.nn.CrossEntropyLoss()(logits, labels)
+
+
+        # 1. 生成增强样本
         noise = th.randn_like(hidden_states) * 0.1
         z_team_aug = self.team_encoder(hidden_states + noise)
-        
-        # 2. 轨迹聚合 (Trajectory Pooling) - 关键步骤
-        # 我们需要处理 Padding，只对有效时间步求平均
-        # mask shape: [Batch, Seq, 1] -> 确保 mask 维度正确
-        mask_expanded = mask.expand_as(z_team) # [Batch, Seq, Latent]
-        
-        # 计算有效时间步的 sum
-        sum_z_team = (z_team * mask_expanded).sum(dim=1)         # [Batch, Latent]
-        sum_z_team_aug = (z_team_aug * mask_expanded).sum(dim=1) # [Batch, Latent]
-        
-        # 计算每个 Batch 的有效长度 (防止除以 0，加一个极小值)
-        seq_lengths = mask.sum(dim=1).expand(-1, self.args.team_latent_dim) # [Batch, Latent]
-        seq_lengths = th.clamp(seq_lengths, min=1.0)
-        
-        # 得到轨迹级的 Embedding [Batch, Latent]
-        traj_repr = sum_z_team / seq_lengths
-        traj_repr_aug = sum_z_team_aug / seq_lengths
-        
-        # 3. 归一化 (L2 Normalize) - 推荐操作
-        # 对比学习中，特征归一化通常能稳定训练
-        traj_repr = F.normalize(traj_repr, dim=1)
-        traj_repr_aug = F.normalize(traj_repr_aug, dim=1)
 
-        # 4. 计算 InfoNCE Loss (Batch Contrast)
-        # Logits shape: [Batch, Batch]
-        # (i, j) 元素代表：第 i 条轨迹 与 第 j 条增强轨迹 的相似度
-        logits = th.matmul(traj_repr, traj_repr_aug.T) / self.args.cl_temp
-        
+        # 2. 归一化特征 (保留 Sequence 维度)
+        # shape: [Batch, Seq, Latent]
+        z_team_norm = F.normalize(z_team, dim=-1)
+        z_team_aug_norm = F.normalize(z_team_aug, dim=-1)
+
+        # 3. 计算对齐的 InfoNCE 损失
+        # 我们希望在同一个时间步 t，不同 batch 的 z_team 能够被区分开
+        # 使用 einsum 快速计算 batch 之间的相似度矩阵
+        # logits shape: [Seq, Batch, Batch]
+        logits = th.einsum('btf,ctf->tbc', z_team_norm, z_team_aug_norm) / self.args.cl_temp
+
         # 标签：对角线是正样本 (0,0), (1,1)...
-        labels = th.arange(logits.shape[0]).to(self.device)
-        loss_cl = th.nn.CrossEntropyLoss()(logits, labels)
+        labels = th.arange(logits.shape[1]).to(self.device)
+        # 将 labels 扩展到与 Seq 一致: [Seq, Batch]
+        labels = labels.unsqueeze(0).expand(logits.shape[0], -1)
+
+        # 调整形状以适应 CrossEntropyLoss: [Seq * Batch, Batch] 和 [Seq * Batch]
+        logits_flat = logits.reshape(-1, logits.shape[-1])
+        labels_flat = labels.reshape(-1)
+
+        # 使用原来的 mask 过滤掉 padding 的无效时间步
+        mask_flat = mask.expand_as(z_team_norm)[:, :, 0].reshape(-1) # [Seq * Batch]
+        valid_indices = mask_flat.nonzero().squeeze()
+
+        if valid_indices.numel() > 0:
+            valid_logits = logits_flat[valid_indices]
+            valid_labels = labels_flat[valid_indices]
+            loss_cl = th.nn.CrossEntropyLoss()(valid_logits, valid_labels)
+        else:
+            loss_cl = th.tensor(0.0).to(self.device)
 
         # total loss
         # loss = loss_act + lambda_nav * loss_nav + self.args.cl_weight * loss_cl

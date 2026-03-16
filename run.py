@@ -472,19 +472,19 @@ def visualize_trajectory_subplots_pdf(runner, mac, checkpoint_paths, args, save_
             ax.scatter(traj_s_2d[-1, 0], traj_s_2d[-1, 1], facecolor=color, s=100, marker='X', edgecolors='black', zorder=5)
 
             # 4. 绘制唯一的 Goal (同色大三角形)
-            ax.scatter(goal_2d[0], goal_2d[1], facecolor=color, edgecolor='black', marker='^', s=250, alpha=0.9, zorder=6)
+            ax.scatter(goal_2d[0], goal_2d[1], facecolor=color, edgecolor='black', marker='^', s=100, alpha=0.9, zorder=6)
             
             # 5. 绘制连接 起点 与 Goal 的意图虚线
-            ax.plot([traj_s_2d[0, 0], goal_2d[0]], [traj_s_2d[0, 1], goal_2d[1]], 
-                    color=color, linestyle='--', linewidth=1.5, alpha=0.6, zorder=1)
+            # ax.plot([traj_s_2d[0, 0], goal_2d[0]], [traj_s_2d[0, 1], goal_2d[1]], 
+                    # color=color, linestyle='--', linewidth=1.5, alpha=0.6, zorder=1)
             
             start_idx = end_idx
 
         # 设置子图属性
         ax.set_title(f'Training Stage: {label}', fontsize=14, fontweight='bold')
-        ax.set_xlabel('t-SNE Dim 1', fontsize=12)
-        if i == 0:
-            ax.set_ylabel('t-SNE Dim 2', fontsize=12)
+        # ax.set_xlabel('t-SNE Dim 1', fontsize=12)
+        # if i == 0:
+        #     ax.set_ylabel('t-SNE Dim 2', fontsize=12)
         
         # 统一坐标轴
         ax.set_xlim(x_min - x_pad, x_max + x_pad)

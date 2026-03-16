@@ -112,6 +112,12 @@ class Diff_Hilp2_Runner:
 
         self.running_fr_max = 1e-4
         self.running_max_dist = 0.1 # 初始化为一个合理的小值
+
+        self.save_goal_interval = 50000     # 训练阶段的间隔步数 (例如每 1万步是一个新阶段)
+        self.trajs_per_stage = 5            # 每个阶段要求保存的轨迹数量
+        self.next_save_stage_t = self.save_goal_interval # 下一次触发收集的步数阈值
+        self.is_collecting_goals = False    # 收集开关：当前是否正在为某个阶段收集数据
+        self.collected_trajs = 0            # 当前阶段已经收集了多少条
         
 
     def setup(self, scheme, groups, preprocess, mac):
@@ -367,13 +373,47 @@ class Diff_Hilp2_Runner:
             states, goals, dis, exp_reward = self.test_phi(self.batch["state"], self.batch["terminated"], self.batch["goal"], self.batch["actions"], self.batch["factor_reward"])
             return states, goals, dis, exp_reward
         
-        if self.args.vis_state == False and self.t_env <= 200000 and self.t_env - self.log_goal_t >= 10000:
-            self.goals.append(self.batch["goal"][:,0,:].detach().cpu().numpy())
-            self.start_states.append(self.batch["state"][:,0,:].detach().cpu().numpy())
-            self.log_goal()
-            self.goals = []
-            self.start_states = []
-            self.log_goal_t = self.t_env
+        # if self.args.vis_state == False and self.t_env <= 200000 and self.t_env - self.log_goal_t >= 1000:
+        #     self.goals.append(self.batch["goal"][:,0,:].detach().cpu().numpy())
+        #     self.start_states.append(self.batch["state"][:,0,:].detach().cpu().numpy())
+        #     self.log_goal()
+        #     self.goals = []
+        #     self.start_states = []
+        #     self.log_goal_t = self.t_env
+
+        # 收集每个阶段 5 条轨迹的逻辑 ----------
+        # 确保只在训练模式、非可视化模式、且总步数不超过20万步时执行
+        if not test_mode and self.args.vis_state == False:
+            
+            # 1. 触发器：如果达到了新的阶段（比如刚迈过50k），打开收集开关
+            if self.t_env >= self.next_save_stage_t and not self.is_collecting_goals:
+                self.is_collecting_goals = True
+                self.collected_trajs = 0
+                self.goals = []
+                self.start_states = []
+                self.next_save_stage_t += self.save_goal_interval  # 设定下一个阶段的触发点
+                print(f"\n[*] 达到训练阶段 {self.t_env} 步，开始收集 {self.trajs_per_stage} 条起止状态...")
+
+            # 2. 收集器：如果开关开启，则提取当前这 1 个 episode（轨迹）的起止点
+            if self.is_collecting_goals:
+                # 提取第 0 步的状态和目标 (Shape: [dim])
+                start_s = self.batch["state"][0, 0, :].detach().cpu().numpy()
+                goal_s = self.batch["goal"][0, 0, :].detach().cpu().numpy()
+                
+                self.start_states.append(start_s)
+                self.goals.append(goal_s)
+                self.collected_trajs += 1
+
+                # 3. 保存器：如果当前阶段已经集齐了 5 条，执行保存并关闭开关
+                if self.collected_trajs >= self.trajs_per_stage:
+                    # 用当前的近似 k 步数作为文件名标识（如 50k, 100k）
+                    stage_name = str(int(self.t_env / 1000)) + "k" 
+                    self.save_stage_goals(stage_name) # 调用新的保存函数
+                    
+                    self.is_collecting_goals = False  # 关闭开关，等待下一个 50k
+                    self.goals = []
+                    self.start_states = []
+        # ------------------------------------------------------------
 
         return self.batch
 
@@ -402,13 +442,6 @@ class Diff_Hilp2_Runner:
         rewards = rewards.squeeze()[:avil_state_range, :]
         actions = actions.reshape(-1, self.args.n_agents)
 
-        # phi1, phi2 = self.mac.embedding.encode(states)
-        # goal_phi1, goal_phi2 = self.mac.embedding.encode(goals)
-        # phi = (phi1 + phi2)/2
-        # goal_phi = (goal_phi1 + goal_phi2)/2
-
-        # squared_dist = ((phi - goal_phi) ** 2).sum(axis=-1)
-        # v_t = torch.sqrt(torch.clamp(squared_dist, min=1e-6))
         split_goals = self.split_global_vector(goals, self.args.n_agents, self.args.n_enemy, self.args.teammate_dim, self.args.enemy_dim)
         split_state = self.split_global_vector(states, self.args.n_agents, self.args.n_enemy, self.args.teammate_dim, self.args.enemy_dim)
         v_t = self.split_distance(to_numpy(split_state), to_numpy(split_goals))
@@ -418,10 +451,29 @@ class Diff_Hilp2_Runner:
     def log_goal(self):
         goals = np.array(self.goals)
         start_states = np.array(self.start_states)
-        log_name = "/home/songshoucheng/GUF_2025/log_goals/goals_"+ str(int(self.t_env / 10000)) + ".pkl"
+        log_name = "/home/songshoucheng/GUF_2025/log_goals/goals_"+ str(int(self.t_env / 5000)) + ".pkl"
         with open(log_name, 'wb') as f:
             pickle.dump(goals, f)
 
-        state_log_name = "/home/songshoucheng/GUF_2025/log_goals/starts_"+ str(int(self.t_env / 10000)) + ".pkl"
+        state_log_name = "/home/songshoucheng/GUF_2025/log_goals/starts_"+ str(int(self.t_env / 5000)) + ".pkl"
         with open(state_log_name, 'wb') as f:
             pickle.dump(start_states, f)
+    
+    def save_stage_goals(self, stage_name):
+        goals_arr = np.array(self.goals)
+        starts_arr = np.array(self.start_states)
+        
+        # 确保目标文件夹一定存在，防止 FileNotFoundError
+        save_dir = "/home/songshoucheng/GUF_2025/log_goals"
+        os.makedirs(save_dir, exist_ok=True)
+
+        goal_path = os.path.join(save_dir, f"goals_stage_{stage_name}.pkl")
+        start_path = os.path.join(save_dir, f"starts_stage_{stage_name}.pkl")
+        
+        with open(goal_path, 'wb') as f:
+            pickle.dump(goals_arr, f)
+            
+        with open(start_path, 'wb') as f:
+            pickle.dump(starts_arr, f)
+            
+        print(f"[*] 成功！已将阶段 [{stage_name}] 的 {self.collected_trajs} 条 Start-Goal 轨迹保存至: {save_dir}")

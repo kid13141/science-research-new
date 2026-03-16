@@ -199,6 +199,14 @@ class Diff_Hilp3_Runner:
         
         return teammate_features
 
+    def split_distance(self, state_vector, goal_vector):
+        distances = np.linalg.norm(state_vector - goal_vector, axis=-1, keepdims=True)
+        # distances = np.sum(np.abs(state_vector - goal_vector), -1)
+        N = state_vector.shape[-1]
+        sqrt_N = math.sqrt(N)
+        distances /= sqrt_N
+        return torch.from_numpy(distances).float().to(self.args.device)
+
 
     def swap_dim(self, arr, dims, random_seed=None):
         if random_seed is not None:
