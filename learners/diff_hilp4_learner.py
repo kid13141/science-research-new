@@ -218,11 +218,18 @@ class Diff_Hilp4_Learner:
             r_diversity = self.history_buffer.compute_entropy_reward(z_team)
             # 间隔更新 History Buffer
             if episode_num % self.args.buffer_update_interval == 0:
-                # 展平并存入
+                # 展平特征
                 flat_z = z_team.reshape(-1, self.args.team_latent_dim)
-                # 随机采样一部分存入，而不是全部 
+                
+                # 保留 stride 初步降采样，这能大幅减少进入 Buffer 内部进行距离计算的样本数，加快训练速度
                 stride = self.args.buffer_stride
-                self.history_buffer.add(flat_z[::stride].detach())
+                candidate_z = flat_z[::stride].detach()
+                
+                # 引入新奇度阈值 epsilon (建议在 yaml 配置文件中增加 buffer_epsilon 参数，这里给一个默认值 fallback)
+                epsilon = getattr(self.args, "buffer_epsilon", 0.05) 
+                
+                # 调用新的 add 方法
+                self.history_buffer.add(candidate_z, epsilon=epsilon)
 
         beta = max(0, self.args.diversity_beta * (1 - t_env / self.args.t_max))
     

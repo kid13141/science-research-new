@@ -8,30 +8,72 @@ class HistoryBuffer:
         self.device = device
         self.latent_dim = latent_dim
         
-        # 初始化 Buffer，预分配显存
         self.buffer = torch.zeros(capacity, latent_dim).to(device)
-        self.ptr = 0
-        self.size = 0
+        self.size = 0  # 丢弃了 self.ptr，因为不再是 FIFO 队列
         self.full = False
         
-    def add(self, z_team):
+    def add(self, z_team, epsilon=0.05):
         """
-        z_team: [Batch * Seq_Len, Latent_Dim]
-        注意：传入前需要 detach() 并且 reshape 成二维
+        z_team: [N, Latent_Dim]
+        epsilon: 距离阈值，决定新样本是否足够“新颖”
         """
-        n_samples = z_team.shape[0]
-        if n_samples == 0:
+        if z_team.shape[0] == 0:
             return
 
-        # 简单的 FIFO 循环覆盖
-        indices = torch.arange(self.ptr, self.ptr + n_samples) % self.capacity
-        self.buffer[indices] = z_team
-        
-        self.ptr = (self.ptr + n_samples) % self.capacity
-        if self.size < self.capacity:
-            self.size = min(self.size + n_samples, self.capacity)
-            if self.size == self.capacity:
-                self.full = True
+        for i in range(z_team.shape[0]):
+            z = z_team[i]
+            
+            # 如果 Buffer 为空，直接加入第一个
+            if self.size == 0:
+                self.buffer[0] = z
+                self.size = 1
+                continue
+                
+            current_buf = self.buffer[:self.size]
+            
+            # ==========================================
+            # 1. 新奇度检查 (Novelty Check)
+            # ==========================================
+            # 计算当前样本 z 到已有 Buffer 所有样本的欧式距离
+            dists = torch.norm(current_buf - z, dim=1) # [size]
+            min_dist = dists.min()
+            
+            if min_dist < epsilon:
+                # 距离小于阈值，说明该特征已被现有样本代表，直接丢弃
+                continue
+                
+            # ==========================================
+            # 2. 如果 Buffer 未满，直接追加
+            # ==========================================
+            if self.size < self.capacity:
+                self.buffer[self.size] = z
+                self.size += 1
+                if self.size == self.capacity:
+                    self.full = True
+            
+            # ==========================================
+            # 3. Buffer 已满，基于密度替换 (Density-based)
+            # ==========================================
+            else:
+                # 为了计算效率，随机抽取一部分样本（如 256 个）来评估密度
+                eval_size = min(self.size, 256)
+                idx = torch.randperm(self.size, device=self.device)[:eval_size]
+                subset = self.buffer[idx]
+                
+                # 计算这 eval_size 个样本与整个 Buffer 的距离矩阵 [eval_size, size]
+                sub_dists = torch.cdist(subset.unsqueeze(0), current_buf.unsqueeze(0)).squeeze(0)
+                
+                # 排除自己到自己的距离 (将 0 替换为无穷大，防止被误认为是最小距离)
+                sub_dists.fill_diagonal_(float('inf'))
+                
+                # 找到 subset 中，与其最近邻距离最小的那个样本 
+                # (距离最小，意味着它处于最拥挤/密度最高的冗余区域)
+                min_sub_dists, _ = sub_dists.min(dim=1)
+                victim_subset_idx = min_sub_dists.argmin()
+                victim_idx = idx[victim_subset_idx]
+                
+                # 用新颖的样本 z 替换掉这个拥挤区域的冗余样本
+                self.buffer[victim_idx] = z
 
     def compute_entropy_reward(self, z_query):
         """

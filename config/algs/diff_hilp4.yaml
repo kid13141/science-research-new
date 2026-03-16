@@ -66,3 +66,4 @@ nav_weight_max: 0.6
 nav_weight_min: 0.2
 nav_test_weight: 0.1
 nav_weight_anneal_steps: 100000 
+buffer_epsilon: 0.05
